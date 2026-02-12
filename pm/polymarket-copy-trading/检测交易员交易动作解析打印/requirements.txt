@@ -1,0 +1,27 @@
+
+
+# 异步HTTP客户端
+aiohttp>=3.8.0
+
+
+
+# HTTP客户端
+requests>=2.28.0
+
+# Polymarket CLOB客户端 (用于实盘交易)
+# 注意: 如果不需要实盘交易功能，可以注释此行
+py_clob_client>=0.2.0
+
+# 加密库 (用于secure_tool.py)
+cryptography>=3.4.8
+
+# 数据库驱动
+pymysql>=1.0.0
+
+
+
+# 其他可能需要的依赖
+# 如果运行时提示缺少某个模块，请在此添加
+
+# Web3.py (用于区块链交互)
+web3>=6.0.0
