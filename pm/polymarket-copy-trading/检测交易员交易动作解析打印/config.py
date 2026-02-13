@@ -7,8 +7,6 @@ from web3 import Web3
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any, List
 
-from db_config import DB_CONFIG
-
 def setup_logger(name="PolymarketMonitor"):
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
@@ -49,21 +47,7 @@ class SecureConfig:
         
         # ===== 目标交易员配置 =====
         # 需要监控的目标交易员地址列表
-        self.target_traders: List[str] = ["0xed107a85a4585a381e48c7f7ca4144909e7dd2e5",
-                                          "0x5bffcf561bcae83af680ad600cb99f1184d6ffbe",
-                                          "0x9b979a065641e8cfde3022a30ed2d9415cf55e12",
-                                          "0xd1acd3925d895de9aec98ff95f3a30c5279d08d5",
-                                          "0x44c1dfe43260c94ed4f1d00de2e1f80fb113ebc1",
-                                          "0x000d257d2dc7616feaef4ae0f14600fdf50a758e",
-                                          "0x55be7aa03ecfbe37aa5460db791205f7ac9ddca3",
-                                          "0xf2f6af4f27ec2dcf4072095ab804016e14cd5817",
-                                          "0xdbade4c82fb72780a0db9a38f821d8671aba9c95",
-                                          "0x090a0d3fc9d68d3e16db70e3460e3e4b510801b4",
-                                          "0xee00ba338c59557141789b127927a55f5cc5cea1",
-                                          "0x2f09642639aedd6ced432519c1a86e7d52034632",
-                                          "0x204f72f35326db932158cba6adff0b9a1da95e14",
-                                          "0x509587cbb541251c74f261df3421f1fcc9fdc97c",
-                                          "0x8a4c788f043023b8b28a762216d037e9f148532b"
+        self.target_traders: List[str] = [""
                                           ]
         # self.target_traders: List[str] = ["0xCf2EAeAaB60579cd9d5750b5FF37a29F7d92c972"]
         # 针对特定交易员的个性化配置（如跟单比例）
@@ -271,6 +255,12 @@ class SecureConfig:
             self.min_trade_ratio = float(os.getenv("MIN_TRADE_RATIO", "0.1")) / 100.0
         except ValueError:
             self.min_trade_ratio = 0.1 / 100.0
+        
+        # 大额交易阈值配置（超过此金额可跳过 min_trade_ratio 限制）
+        try:
+            self.large_order_threshold = float(os.getenv("LARGE_ORDER_THRESHOLD", "300"))
+        except ValueError:
+            self.large_order_threshold = 300.0
         
         try:
             self.max_trader_usage_cap = float(os.getenv("MAX_TRADER_USAGE_CAP", "0.1"))

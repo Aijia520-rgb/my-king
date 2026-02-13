@@ -30,15 +30,13 @@ from dataclasses import dataclass
 from typing import Dict, Any, Optional
 
 from config import Config, logger, get_config
-from ding import TRADER_NICKNAME_CACHE
 from enrichment_service import EnrichmentService
 from monitor_service import MonitorService
 from trade_execution_service import TradeExecutionService
 from position_analysis_service import PositionAnalysisService
-# 屏蔽 httpx 和 httpcore 的 INFO 日志，避免 API 请求刷屏
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 from auto_redeem import AutoRedeemService
+
+TRADER_NICKNAME_CACHE: Dict[str, str] = {}
 
 async def fetch_single_nickname(session, trader):
     """获取单个交易员昵称并缓存"""

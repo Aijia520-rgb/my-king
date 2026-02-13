@@ -4,8 +4,19 @@ import time
 import aiohttp
 from datetime import datetime
 from config import get_config, logger
-from ding import get_trader_display_info
 from rate_limiter import global_rate_limiter
+
+TRADER_NICKNAME_CACHE: dict = {}
+
+def get_trader_display_info(trader_address: str) -> str:
+    """获取交易员显示信息（昵称或地址）"""
+    if not trader_address:
+        return "未知交易员"
+    
+    trader_address = trader_address.lower()
+    if trader_address in TRADER_NICKNAME_CACHE:
+        return f"{TRADER_NICKNAME_CACHE[trader_address]} ({trader_address[:6]}...)"
+    return f"{trader_address[:6]}..."
 
 class MonitorService:
     def __init__(self, decoder_service, enrichment_service):

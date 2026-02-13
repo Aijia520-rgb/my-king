@@ -23,7 +23,18 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict
 from config import Config, logger
 from enrichment_service import EnrichmentService
-from ding import send_ding_async, format_combined_msg, get_trader_display_info
+
+TRADER_NICKNAME_CACHE: dict = {}
+
+def get_trader_display_info(trader_address: str) -> str:
+    """获取交易员显示信息（昵称或地址）"""
+    if not trader_address:
+        return "未知交易员"
+    
+    trader_address = trader_address.lower()
+    if trader_address in TRADER_NICKNAME_CACHE:
+        return f"{TRADER_NICKNAME_CACHE[trader_address]} ({trader_address[:6]}...)"
+    return f"{trader_address[:6]}..."
 
 # Polymarket CLOB client
 try:
@@ -293,35 +304,12 @@ class TradeExecutionService:
                     'amount_usdc': signal.amount_usdc
                 }
             except Exception as e:
-                logger.error(f"[DING] 获取交易员信息失败: {e}")
+                logger.error(f"[TRADE] 获取交易员信息失败: {e}")
                 trader_info = {}
 
             # 检查订单参数是否有效
             if not order_params:
                 logger.info(f"[TRADE] 订单参数无效，跳过此跟单信号")
-                # 发送合并通知 (跳过/失败)
-                try:
-                    our_balance = await self._get_our_usdc_balance()
-                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    wallet_name = self.config.user_name if hasattr(self.config, 'user_name') else "未知钱包"
-                    
-                    # 使用具体的错误原因
-                    error_msg = error_reason if error_reason else "订单参数无效或不满足过滤条件"
-                    
-                    our_info = {
-                        'our_address': self.proxy_wallet,
-                        'our_balance': our_balance,
-                        'amount': 0,
-                        'shares': 0,
-                        'price': order_price if order_price else 0,
-                        'calc_process': calc_details,
-                        'status': "跟单跳过/失败",
-                        'error_msg': error_msg
-                    }
-                    if trader_info:
-                        send_ding_async(format_combined_msg(trader_info, our_info, current_time, wallet_name))
-                except Exception as e:
-                    logger.error(f"[DING] 发送失败通知异常: {e}")
                 return False
 
             # 5. 执行GTC限价单
@@ -333,45 +321,6 @@ class TradeExecutionService:
             else:
                 order_id, taking_amount = None, None
             
-            # 发送合并通知 (尝试下单后)
-            try:
-                our_balance = await self._get_our_usdc_balance()
-                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                wallet_name = self.config.user_name if hasattr(self.config, 'user_name') else "未知钱包"
-                
-                # 状态判断逻辑优化
-                if order_id:
-                    # 尝试解析 taking_amount
-                    try:
-                        taking_amt_val = float(taking_amount) if taking_amount else 0.0
-                    except:
-                        taking_amt_val = 0.0
-                        
-                    if taking_amt_val > 0:
-                        status_text = "跟单成功"
-                    else:
-                        status_text = "挂单中"
-                else:
-                    status_text = "跟单失败"
-
-                error_text = None if order_id else "下单请求被拒绝或网络错误"
-                
-                our_info = {
-                    'our_address': self.proxy_wallet,
-                    'our_balance': our_balance,
-                    'amount': order_params['size'],
-                    'shares': order_params['shares'],
-                    'price': order_params['price'],
-                    'calc_process': calc_details,
-                    'status': status_text,
-                    'error_msg': error_text
-                }
-                
-                if trader_info:
-                    send_ding_async(format_combined_msg(trader_info, our_info, current_time, wallet_name))
-            except Exception as e:
-                logger.error(f"[DING] 发送跟单通知失败: {e}")
-
             if not order_id:
                 # 即使下单失败也要更新持仓数据
                 await self._update_positions_after_trade(signal)
@@ -548,21 +497,33 @@ class TradeExecutionService:
 
     async def _should_skip_buy_due_to_trader_balance_threshold(self, signal: TradeSignal) -> bool:
         """
-        BUY 信号的“交易员余额阈值过滤”。
+        BUY 信号的"交易员余额阈值过滤"。
 
         需求语义：
-        - 当交易员对该 token “有持仓”时，才触发本过滤；
+        - 当交易员对该 token "有持仓"时，才触发本过滤；
         - 若交易员本次下单金额未达到其余额的一定比例阈值，则跳过该订单。
+        - 例外：如果交易员本次下单金额超过大额阈值（LARGE_ORDER_THRESHOLD），则跳过此限制
 
         阈值定义：
         - 阈值百分比读取自 [`Config.MIN_TRADE_RATIO`](检测交易员交易动作解析打印/config.py:100)
-          - 默认 0.1，按“百分比 0.1%”解释，因此这里要除以 100。
+          - 默认 0.1，按"百分比 0.1%"解释，因此这里要除以 100。
+        - 大额阈值读取自 [`Config.LARGE_ORDER_THRESHOLD`](检测交易员交易动作解析打印/config.py:100)
+          - 默认 300 USDC
 
         返回：
         - True：应跳过该 BUY 信号
         - False：继续执行后续定价/算参/下单
         """
         try:
+            # 检查是否为大额交易，如果是则跳过 min_trade_ratio 限制
+            large_order_threshold = getattr(self.config, 'large_order_threshold', 300.0)
+            if signal.amount_usdc >= large_order_threshold:
+                logger.info(
+                    f"[TRADE] 交易员下单金额 {signal.amount_usdc:.2f} USDC >= 大额阈值 "
+                    f"{large_order_threshold:.2f} USDC，跳过 min_trade_ratio 限制检查"
+                )
+                return False
+
             trader_balance = await self._get_trader_usdc_balance(signal.source_address)
             min_trade_ratio_percent = self.config.min_trade_ratio * 100
             min_trade_amount = float(trader_balance) * (min_trade_ratio_percent / 100.0)
@@ -575,6 +536,10 @@ class TradeExecutionService:
                 )
                 return True
 
+            return False
+        except Exception as e:
+            # 过滤逻辑异常时，为避免误跳过（漏跟单），默认继续执行
+            logger.warning(f"[TRADE] 交易员余额阈值过滤计算失败，继续执行该订单: {e}")
             return False
         except Exception as e:
             # 过滤逻辑异常时，为避免误跳过（漏跟单），默认继续执行
@@ -602,8 +567,21 @@ class TradeExecutionService:
 
             # 检查交易员持仓缓存是否存在
             if not trader_positions_cache:
-                logger.warning(f"[POSITION] 交易员持仓缓存为空")
-                return result
+                logger.warning(f"[POSITION] 交易员持仓缓存为空，尝试从API获取...")
+                # 缓存未命中，调用API获取并更新缓存
+                try:
+                    await self._fetch_trader_positions(trader_address)
+                    # 重新从缓存读取
+                    if self.memory_monitor:
+                        trader_positions_cache = self.memory_monitor.get_trader_positions_cache()
+                    else:
+                        from balance_monitor import IntegratedMonitor
+                        monitor = IntegratedMonitor()
+                        trader_positions_cache = monitor.get_trader_positions_cache()
+                    logger.info(f"[POSITION] 已从API获取并缓存交易员持仓数据")
+                except Exception as api_e:
+                    logger.warning(f"[POSITION] 从API获取交易员持仓失败: {api_e}")
+                    return result
 
             # 查找交易员（大小写不敏感）
             target_trader_key = None
@@ -617,8 +595,32 @@ class TradeExecutionService:
                         break
             
             if not target_trader_key:
-                logger.warning(f"[POSITION] 未找到交易员 {get_trader_display_info(trader_address)} 的持仓数据")
-                return result
+                logger.warning(f"[POSITION] 未找到交易员 {get_trader_display_info(trader_address)} 的持仓数据，尝试从API获取...")
+                # 缓存未命中，调用API获取并更新缓存
+                try:
+                    await self._fetch_trader_positions(trader_address)
+                    # 重新从缓存读取
+                    if self.memory_monitor:
+                        trader_positions_cache = self.memory_monitor.get_trader_positions_cache()
+                    else:
+                        from balance_monitor import IntegratedMonitor
+                        monitor = IntegratedMonitor()
+                        trader_positions_cache = monitor.get_trader_positions_cache()
+                    # 再次查找
+                    if trader_address in trader_positions_cache:
+                        target_trader_key = trader_address
+                    else:
+                        for cached_addr in trader_positions_cache:
+                            if cached_addr.lower() == trader_address_lower:
+                                target_trader_key = cached_addr
+                                break
+                    if target_trader_key:
+                        logger.info(f"[POSITION] 已从API获取并缓存交易员持仓数据")
+                except Exception as api_e:
+                    logger.warning(f"[POSITION] 从API获取交易员持仓失败: {api_e}")
+                
+                if not target_trader_key:
+                    return result
 
             # 查找指定token的持仓
             for position in trader_positions_cache[target_trader_key]:
@@ -662,8 +664,25 @@ class TradeExecutionService:
 
             if not position_cache or not position_cache.get('positions'):
                 if show_warning:
-                    logger.warning(f"[POSITION] 内存持仓缓存为空")
-                return 0.0
+                    logger.warning(f"[POSITION] 内存持仓缓存为空，尝试从API获取...")
+                # 缓存未命中，调用API获取并更新缓存
+                try:
+                    await self._fetch_and_cache_positions()
+                    # 重新从缓存读取
+                    if self.memory_monitor:
+                        position_cache = self.memory_monitor.get_position_cache()
+                    else:
+                        from balance_monitor import IntegratedMonitor
+                        monitor = IntegratedMonitor()
+                        position_cache = monitor.get_position_cache()
+                    logger.info(f"[POSITION] 已从API获取并缓存持仓数据")
+                except Exception as api_e:
+                    logger.warning(f"[POSITION] 从API获取持仓失败: {api_e}")
+                    return 0.0
+                
+                # 再次检查缓存
+                if not position_cache or not position_cache.get('positions'):
+                    return 0.0
 
             # 查找指定token的持仓
             for position in position_cache.get("positions", []):
@@ -1729,7 +1748,20 @@ class TradeExecutionService:
                     logger.info(f"[BALANCE] 交易员 {trader_address[:8]}... 余额: {balance_usdc:.2f} USDC (从内存读取)")
                     return balance_usdc
                 else:
-                    logger.warning(f"[BALANCE] 交易员 {trader_address[:8]}... 余额信息不存在于内存中")
+                    logger.warning(f"[BALANCE] 交易员 {trader_address[:8]}... 余额信息不存在于内存中，尝试从API获取...")
+                    # 缓存未命中，调用API获取并更新缓存
+                    try:
+                        await self._update_trader_balance(trader_address)
+                        # 重新从缓存读取
+                        balance_cache = self.memory_monitor.get_balance_cache()
+                        if balance_cache and trader_address in balance_cache:
+                            balance_record = balance_cache[trader_address]
+                            balance_usdc = float(balance_record.balance)
+                            logger.info(f"[BALANCE] 交易员 {trader_address[:8]}... 余额: {balance_usdc:.2f} USDC (从API获取并缓存)")
+                            return balance_usdc
+                    except Exception as api_e:
+                        logger.warning(f"[BALANCE] 从API获取交易员余额失败: {api_e}")
+                    
                     if balance_cache:
                         logger.warning(f"[BALANCE] 内存中可用地址示例: {list(balance_cache.keys())[:3]}...")
                     return 1000.0  # 返回默认值避免程序中断
@@ -1794,7 +1826,19 @@ class TradeExecutionService:
                     logger.info(f"[BALANCE] 我们的钱包 {our_address[:8]}... 余额: {balance_usdc:.2f} USDC (从内存读取)")
                     return balance_usdc
                 else:
-                    logger.warning(f"[BALANCE] 我们的钱包 {our_address[:8]}... 余额信息不存在于内存中")
+                    logger.warning(f"[BALANCE] 我们的钱包 {our_address[:8]}... 余额信息不存在于内存中，尝试从API获取...")
+                    # 缓存未命中，调用API获取并更新缓存
+                    try:
+                        await self._fetch_and_cache_balance()
+                        # 重新从缓存读取
+                        balance_cache = self.memory_monitor.get_balance_cache()
+                        if balance_cache and our_address in balance_cache:
+                            balance_record = balance_cache[our_address]
+                            balance_usdc = float(balance_record.balance)
+                            logger.info(f"[BALANCE] 我们的钱包 {our_address[:8]}... 余额: {balance_usdc:.2f} USDC (从API获取并缓存)")
+                            return balance_usdc
+                    except Exception as api_e:
+                        logger.warning(f"[BALANCE] 从API获取我们的余额失败: {api_e}")
                     return 10.0  # 返回默认值避免程序中断
             else:
                 # 如果没有内存监控器，返回默认值
