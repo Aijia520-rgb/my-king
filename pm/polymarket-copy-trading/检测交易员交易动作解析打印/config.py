@@ -84,6 +84,10 @@ class SecureConfig:
         # ===== 风险控制配置 =====
         # 最大持仓金额 (单位: USDC)，超过此金额将不再开仓
         self.max_position_size: float = 50000
+        # 每个市场方向最大持仓比例 (相对于我们可用余额的比例，如 0.1 表示 10%)
+        self.max_position_per_market_ratio: float = 0.1
+        # 每个市场方向最大持仓金额 (USDC)，如果设置则优先使用此金额限制，否则使用比例限制
+        self.max_position_per_market_amount: Optional[float] = None
         # 最小交易比例，低于此比例的交易将被忽略
         self.min_trade_ratio: float = 0.1 / 100
         # 交易员资金使用比例上限 (默认 0.1，即 10%)
@@ -91,6 +95,14 @@ class SecureConfig:
         # 例如：交易员余额1000，下单500 (50%)。如果上限设为 0.1 (10%)，
         # 我们只按 10% 的比例跟单，而不是 50%。
         self.max_trader_usage_cap: float = 0.1
+        # 大额交易阈值 (单位: USDC)，超过此金额跳过 min_trade_ratio 限制
+        self.large_order_threshold: float = 800.0
+        # 买入溢价 (单位: 小数，如 0.01 表示 1%)
+        self.buy_premium: float = 0.01
+        # 卖出折价 (单位: 小数，如 0.01 表示 1%)
+        self.sell_premium: float = 0.02
+        # 市场标题黑名单（不跟单的市场标题列表）
+        self.market_title_blacklist: List[str] = []
         # 交易失败后的最大重试次数
         self.max_retry_attempts: int = 3
         # 重试间隔时间 (单位: 秒)
@@ -251,21 +263,50 @@ class SecureConfig:
             self.max_position_size = 50000
         
         try:
+            self.max_position_per_market_ratio = float(os.getenv("MAX_POSITION_PER_MARKET_RATIO", "0.1"))
+        except ValueError:
+            self.max_position_per_market_ratio = 0.1
+        
+        try:
+            amount_str = os.getenv("MAX_POSITION_PER_MARKET_AMOUNT", "")
+            if amount_str:
+                self.max_position_per_market_amount = float(amount_str)
+            else:
+                self.max_position_per_market_amount = None
+        except ValueError:
+            self.max_position_per_market_amount = None
+        
+        try:
             # 环境变量中配置的是百分比（如 0.1 表示 0.1%），需要除以 100 转换为小数
             self.min_trade_ratio = float(os.getenv("MIN_TRADE_RATIO", "0.1")) / 100.0
         except ValueError:
             self.min_trade_ratio = 0.1 / 100.0
         
-        # 大额交易阈值配置（超过此金额可跳过 min_trade_ratio 限制）
-        try:
-            self.large_order_threshold = float(os.getenv("LARGE_ORDER_THRESHOLD", "300"))
-        except ValueError:
-            self.large_order_threshold = 300.0
-        
         try:
             self.max_trader_usage_cap = float(os.getenv("MAX_TRADER_USAGE_CAP", "0.1"))
         except ValueError:
             self.max_trader_usage_cap = 0.1
+        
+        try:
+            self.large_order_threshold = float(os.getenv("LARGE_ORDER_THRESHOLD", "800.0"))
+        except ValueError:
+            self.large_order_threshold = 800.0
+        
+        try:
+            self.buy_premium = float(os.getenv("BUY_PREMIUM", "0.01"))
+        except ValueError:
+            self.buy_premium = 0.01
+        
+        try:
+            self.sell_premium = float(os.getenv("SELL_PREMIUM", "0.01"))
+        except ValueError:
+            self.sell_premium = 0.01
+        
+        try:
+            self.market_title_blacklist = json.loads(os.getenv("MARKET_TITLE_BLACKLIST", "[]"))
+        except json.JSONDecodeError:
+            logger.warning("MARKET_TITLE_BLACKLIST in .env is not a valid JSON list. Using empty list.")
+            self.market_title_blacklist = []
 
         # 重试配置
         try:

@@ -189,9 +189,9 @@ async def main():
 
             while True:
                 try:
-                    # --- 自动结算逻辑 (每小时执行一次) ---
+                    # --- 自动结算逻辑 (每10分钟执行一次) ---
                     current_time = time.time()
-                    if current_time - last_redeem_time >= 3600:
+                    if current_time - last_redeem_time >= 600:
                         logger.info("[SCHEDULE] 触发定时自动结算任务...")
                         # 在线程中运行同步的结算脚本，避免阻塞主循环
                         await asyncio.to_thread(auto_redeem_service.execute)

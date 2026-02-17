@@ -218,6 +218,13 @@ class TradeExecutionService:
             if not await self._validate_signal(signal):
                 return False
 
+            # 检查市场标题黑名单
+            market_title = signal.market_info.get('market_slug', '')
+            for blacklist_item in self.config.market_title_blacklist:
+                if blacklist_item.lower() in market_title.lower():
+                    logger.info(f"[TRADE] 市场标题 '{market_title}' 包含黑名单关键词 '{blacklist_item}'，跳过跟单")
+                    return False
+
             # 2. 持仓检查
             if signal.side == "SELL":
                 # 卖出：检查我们和交易员的持仓情况
@@ -516,7 +523,7 @@ class TradeExecutionService:
         """
         try:
             # 检查是否为大额交易，如果是则跳过 min_trade_ratio 限制
-            large_order_threshold = getattr(self.config, 'large_order_threshold', 300.0)
+            large_order_threshold = self.config.large_order_threshold
             if signal.amount_usdc >= large_order_threshold:
                 logger.info(
                     f"[TRADE] 交易员下单金额 {signal.amount_usdc:.2f} USDC >= 大额阈值 "
@@ -700,16 +707,69 @@ class TradeExecutionService:
             logger.warning(f"[POSITION] 从缓存获取持仓失败: {e}")
             return 0.0
 
+    async def _get_position_shares_realtime(self, token_id: str) -> float:
+        """实时从API获取指定token的持仓股数 - 用于买入前检查避免缓存延迟"""
+        try:
+            our_address = self.config.proxy_wallet_address or self.config.local_wallet_address
+            if not our_address:
+                logger.warning("[POSITION] 未配置钱包地址，无法实时查询持仓")
+                return 0.0
+            
+            # 使用Data API实时查询持仓
+            api_url = "https://data-api.polymarket.com/positions"
+            all_positions = []
+            offset = 0
+            limit = 100
+            
+            async with aiohttp.ClientSession() as session:
+                while True:
+                    params = {
+                        'user': our_address,
+                        'limit': limit,
+                        'offset': offset
+                    }
+                    
+                    async with session.get(api_url, params=params) as response:
+                        if response.status == 200:
+                            positions = await response.json()
+                            if not positions:
+                                break
+                            
+                            all_positions.extend(positions)
+                            
+                            # 查找指定token的持仓
+                            for position in positions:
+                                asset_id = position.get("asset") or position.get("token_id")
+                                if asset_id == token_id:
+                                    size = float(position.get("size", 0))
+                                    logger.info(f"[POSITION] 实时查询持仓 Token {token_id[:8]}...: {size:.6f} 股")
+                                    return size
+                            
+                            # 如果返回的持仓数量少于limit，说明已经获取完所有数据
+                            if len(positions) < limit:
+                                break
+                            
+                            offset += limit
+                        else:
+                            logger.warning(f"[POSITION] 实时查询持仓失败: HTTP {response.status}")
+                            break
+            
+            # 未找到该token的持仓
+            return 0.0
+            
+        except Exception as e:
+            logger.warning(f"[POSITION] 实时查询持仓失败: {e}")
+            return 0.0
+
     def _calculate_price_with_premium(self, side: str, trader_price: float) -> Optional[float]:
         """
         计算溢价后的下单价格
         
         策略：
-        - BUY: trader_price + 0.02, max 0.99. (若 trader_price > 0.99 则返回 None 跳过)
-        - SELL: trader_price - 0.02, min 0.01.
+        - BUY: trader_price + buy_premium, max 0.99. (若 trader_price > 0.99 则返回 None 跳过)
+        - SELL: trader_price - sell_premium, min 0.01.
         """
         try:
-            premium = 0.02
             cap_min = 0.001
             cap_max = 0.99
             
@@ -720,11 +780,13 @@ class TradeExecutionService:
                     logger.info(f"[PRICE] BUY 跳过: trader_price={price_f:.6f} > 0.99")
                     return None
                 
+                premium = self.config.buy_premium
                 raw_price = price_f + premium
                 # clamp(raw, 0.001, 0.99)
                 controlled_price = min(max(raw_price, cap_min), cap_max)
                 
             else: # SELL
+                premium = self.config.sell_premium
                 raw_price = price_f - premium
                 # max(raw, 0.01) -> min(..., 0.99)
                 controlled_price = max(raw_price, 0.01)
@@ -1162,7 +1224,39 @@ class TradeExecutionService:
                     logger.warning(f"[ORDER] {msg}")
                     return None, f"跳过: {msg}", msg
 
-            # 4. 应用订单大小限制（买入和卖出使用不同逻辑）
+            # 4. 检查每个市场方向的持仓上限（仅买入时检查）
+            if signal.side == "BUY":
+                # 获取当前此 token 的持仓 - 使用实时API查询避免缓存延迟
+                logger.info(f"[POSITION] 使用实时API查询当前持仓（避免缓存延迟）...")
+                current_position_shares = await self._get_position_shares_realtime(signal.token_id)
+                current_position_value = current_position_shares * order_price if order_price else 0
+                logger.info(f"[POSITION] 实时持仓查询结果: {current_position_value:.2f} USDC ({current_position_shares:.4f} 股)")
+                
+                # 计算持仓上限：优先使用固定金额限制，否则使用余额百分比
+                if self.config.max_position_per_market_amount is not None:
+                    position_limit = self.config.max_position_per_market_amount
+                    limit_type = f"固定金额限制 {position_limit} USDC"
+                else:
+                    position_limit = our_balance * self.config.max_position_per_market_ratio
+                    limit_type = f"余额的 {self.config.max_position_per_market_ratio*100}%"
+                
+                # 检查是否已达到上限
+                if current_position_value >= position_limit:
+                    msg = f"当前持仓 {current_position_value:.2f} USDC 已达到上限 {position_limit:.2f} USDC ({limit_type})"
+                    logger.warning(f"[ORDER] {msg}，跳过买入")
+                    return None, calc_details, msg
+                
+                # 检查本次买入后是否会超过上限
+                total_after_buy = current_position_value + target_amount
+                if total_after_buy > position_limit:
+                    # 调整买入金额，使其不超过上限
+                    adjusted_target = position_limit - current_position_value
+                    logger.warning(f"[ORDER] 本次买入后总持仓 {total_after_buy:.2f} USDC 将超过上限 {position_limit:.2f} USDC ({limit_type})")
+                    logger.info(f"[ORDER] 调整买入金额: {target_amount:.2f} -> {adjusted_target:.2f} USDC")
+                    target_amount = adjusted_target
+                    calc_details += f"\n持仓上限调整: 原{total_after_buy:.2f}超上限({limit_type})，调整为{target_amount:.2f}"
+
+            # 5. 应用订单大小限制（买入和卖出使用不同逻辑）
             max_order_size = self.config.max_order_size  # 最大订单限制
             min_order_size = self.config.min_order_size  # 最小订单限制，可能为None表示无限制
 
@@ -1183,7 +1277,7 @@ class TradeExecutionService:
                     return None, calc_details, msg
 
   
-            # 5. 特殊检查：对于卖出订单，确保不会超过持仓数量
+            # 6. 特殊检查：对于卖出订单，确保不会超过持仓数量
             if signal.side == "SELL":
                 # 重新获取持仓数量进行最终验证
                 our_position_shares = await self._get_position_shares(signal.token_id)
@@ -1202,7 +1296,7 @@ class TradeExecutionService:
 
                 logger.info(f"[ORDER] 卖出限制检查: 持仓价值 {position_value_usdc:.2f} USDC，卖出金额 {target_amount:.2f} USDC")
 
-            # 6. 检查账户余额（仅对买入订单有效，卖出不需要USDC余额）
+            # 7. 检查账户余额（仅对买入订单有效，卖出不需要USDC余额）
             if signal.side == "BUY":
                 # 根据钱包类型决定是否预留gas费
                 if hasattr(self, 'wallet_type') and self.wallet_type == "代理钱包":
@@ -1867,38 +1961,125 @@ class TradeExecutionService:
         }
 
     async def _update_positions_after_trade(self, signal):
-        """跟单成功后更新持仓数据（仅目标交易员和自己）"""
+        """跟单成功后更新持仓数据（仅目标交易员和自己）- 使用内存缓存"""
         try:
             logger.info(f"[UPDATE] 跟单成交，开始更新持仓数据...")
 
-            # 1. 更新目标交易员的持仓
-            logger.info(f"[UPDATE] 更新目标交易员 {signal.source_address[:8]}... 的持仓")
-            await self._fetch_trader_positions(signal.source_address)
+            # 通过 memory_monitor 更新内存缓存（与启动时保持一致）
+            if self.memory_monitor:
+                # 1. 更新目标交易员的持仓
+                logger.info(f"[UPDATE] 更新目标交易员 {signal.source_address[:8]}... 的持仓")
+                from balance_monitor import IntegratedMonitor
+                monitor = IntegratedMonitor()
+                trader_positions = await monitor.get_trader_positions(signal.source_address)
+                current_cache = self.memory_monitor.get_trader_positions_cache()
+                current_cache[signal.source_address] = trader_positions
+                self.memory_monitor.save_trader_positions_to_cache(current_cache)
 
-            # 2. 更新我们自己的持仓
-            logger.info(f"[UPDATE] 更新我们自己的持仓")
-            await self._fetch_and_cache_positions()
+                # 2. 更新我们自己的持仓
+                logger.info(f"[UPDATE] 更新我们自己的持仓")
+                our_address = self.config.proxy_wallet_address or self.config.local_wallet_address
+                if our_address:
+                    our_positions = await monitor.get_my_positions(our_address)
+                    self.memory_monitor.save_positions(our_address, our_positions)
 
-            # 3. 更新余额数据
-            logger.info(f"[UPDATE] 更新余额数据")
-            await self._update_trader_balance(signal.source_address)
-            await self._fetch_and_cache_balance()
+                # 3. 更新余额数据（交易员）
+                logger.info(f"[UPDATE] 更新余额数据")
+                trader_balance = await monitor.get_trader_balance(signal.source_address)
+                current_balances = self.memory_monitor.get_balance_cache()
+                from balance_monitor import BalanceRecord
+                current_balances[signal.source_address] = BalanceRecord(
+                    balance=trader_balance,
+                    timestamp=datetime.now().isoformat()
+                )
+                self.memory_monitor.save_balances(current_balances)
 
-            logger.info(f"[UPDATE] 持仓数据更新完成")
+                # 4. 更新余额数据（我们自己）
+                if our_address:
+                    our_balance = await monitor.get_trader_balance(our_address)
+                    current_balances[our_address] = BalanceRecord(
+                        balance=our_balance,
+                        timestamp=datetime.now().isoformat()
+                    )
+                    self.memory_monitor.save_balances(current_balances)
+
+                logger.info(f"[UPDATE] 持仓数据更新完成（已更新内存缓存）")
+            else:
+                logger.warning(f"[UPDATE] memory_monitor 未初始化，跳过缓存更新")
 
         except Exception as e:
             logger.warning(f"[UPDATE] 跟单后持仓更新失败: {e}")
             # 更新失败不影响交易执行，只记录日志
 
+    async def _get_balance_via_rpc(self, wallet_address: str, token_contract: str) -> float:
+        """通过RPC获取代币余额"""
+        try:
+            rpc_url = getattr(self.config, 'rpc_url', 'https://polygon-rpc.com')
+
+            data = {
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [{
+                    "to": token_contract,
+                    "data": f"0x70a08231000000000000000000000000{wallet_address[2:]}"
+                }, "latest"],
+                "id": 1
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(rpc_url, json=data, timeout=10) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        if "result" in result and result["result"] and result["result"] != "0x":
+                            # USDC有6位小数
+                            balance_wei = int(result["result"], 16)
+                            return balance_wei / 1000000
+            return 0.0
+        except Exception as e:
+            logger.warning(f"[BALANCE] RPC获取余额失败: {e}")
+            return 0.0
+
     async def _fetch_trader_positions(self, trader_address: str):
         """获取并缓存指定交易员的持仓"""
         try:
-            client = self._get_clob_client()
-            # 获取交易员持仓
-            positions_data = await asyncio.to_thread(client.get_positions, trader_address)
+            # 使用 Polymarket Data API 获取持仓
+            api_url = "https://data-api.polymarket.com/positions"
+            all_positions = []
+            offset = 0
+            limit = 100  # API单次查询限制
+
+            while True:
+                params = {
+                    'user': trader_address,
+                    'limit': limit,
+                    'offset': offset
+                }
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(api_url, params=params) as response:
+                        if response.status == 200:
+                            positions = await response.json()
+                            if not positions:
+                                break  # 没有更多数据了
+
+                            all_positions.extend(positions)
+
+                            # 如果返回的持仓数量少于limit，说明已经获取完所有数据
+                            if len(positions) < limit:
+                                break
+
+                            offset += limit
+                        else:
+                            logger.warning(f"[POSITION] 获取交易员 {trader_address[:8]}... 持仓失败: HTTP {response.status}")
+                            break
+
+            positions_data = all_positions
 
             # 更新交易员持仓缓存
             trader_positions_file = os.path.join("data", "trader_positions_cache.json")
+
+            # 确保 data 目录存在
+            os.makedirs(os.path.dirname(trader_positions_file), exist_ok=True)
 
             # 读取现有缓存
             if os.path.exists(trader_positions_file):
@@ -1922,17 +2103,49 @@ class TradeExecutionService:
     async def _fetch_and_cache_positions(self):
         """获取并缓存我们自己的持仓"""
         try:
-            client = self._get_clob_client()
-            # 获取我们的持仓
-            positions_data = await asyncio.to_thread(client.get_positions)
-
-            # 更新持仓缓存
-            position_cache_file = os.path.join("data", "position_cache.json")
-
             # 读取我们的钱包地址
             our_address = self.config.proxy_wallet_address
             if not our_address:
                 our_address = "0xCf2EAeAaB60579cd9d5750b5FF37a29F7d92c972"  # 默认地址
+
+            # 使用 Polymarket Data API 获取持仓
+            api_url = "https://data-api.polymarket.com/positions"
+            all_positions = []
+            offset = 0
+            limit = 100  # API单次查询限制
+
+            while True:
+                params = {
+                    'user': our_address,
+                    'limit': limit,
+                    'offset': offset
+                }
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(api_url, params=params) as response:
+                        if response.status == 200:
+                            positions = await response.json()
+                            if not positions:
+                                break  # 没有更多数据了
+
+                            all_positions.extend(positions)
+
+                            # 如果返回的持仓数量少于limit，说明已经获取完所有数据
+                            if len(positions) < limit:
+                                break
+
+                            offset += limit
+                        else:
+                            logger.warning(f"[POSITION] 获取我们持仓失败: HTTP {response.status}")
+                            break
+
+            positions_data = all_positions
+
+            # 更新持仓缓存
+            position_cache_file = os.path.join("data", "position_cache.json")
+
+            # 确保 data 目录存在
+            os.makedirs(os.path.dirname(position_cache_file), exist_ok=True)
 
             # 构建持仓缓存数据
             position_cache = {
@@ -1952,14 +2165,17 @@ class TradeExecutionService:
             logger.warning(f"[POSITION] 获取我们持仓失败: {e}")
 
     async def _update_trader_balance(self, trader_address: str):
-        """更新交易员余额缓存"""
+        """更新交易员余额缓存 - 通过RPC获取"""
         try:
-            client = self._get_clob_client()
-            # 获取交易员余额
-            balance_data = await asyncio.to_thread(client.get_balance, trader_address)
+            # 使用RPC获取交易员USDC余额
+            USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # Polygon USDC
+            balance_data = await self._get_balance_via_rpc(trader_address, USDC_CONTRACT)
 
             # 更新余额缓存
             balance_cache_file = os.path.join("data", "balance_cache.json")
+
+            # 确保 data 目录存在
+            os.makedirs(os.path.dirname(balance_cache_file), exist_ok=True)
 
             # 读取现有缓存
             if os.path.exists(balance_cache_file):
@@ -1984,19 +2200,22 @@ class TradeExecutionService:
             logger.warning(f"[BALANCE] 更新交易员余额失败: {e}")
 
     async def _fetch_and_cache_balance(self):
-        """获取并缓存我们自己的余额"""
+        """获取并缓存我们自己的余额 - 通过RPC获取"""
         try:
-            client = self._get_clob_client()
-            # 获取我们的余额
-            balance_data = await asyncio.to_thread(client.get_balance)
-
-            # 更新余额缓存
-            balance_cache_file = os.path.join("data", "balance_cache.json")
-
             # 读取我们的钱包地址
             our_address = self.config.proxy_wallet_address
             if not our_address:
                 our_address = "0xCf2EAeAaB60579cd9d5750b5FF37a29F7d92c972"  # 默认地址
+
+            # 使用RPC获取USDC余额
+            USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # Polygon USDC
+            balance_data = await self._get_balance_via_rpc(our_address, USDC_CONTRACT)
+
+            # 更新余额缓存
+            balance_cache_file = os.path.join("data", "balance_cache.json")
+
+            # 确保 data 目录存在
+            os.makedirs(os.path.dirname(balance_cache_file), exist_ok=True)
 
             # 读取现有缓存
             if os.path.exists(balance_cache_file):
