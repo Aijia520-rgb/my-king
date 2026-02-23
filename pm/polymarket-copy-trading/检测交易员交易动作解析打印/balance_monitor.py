@@ -953,8 +953,16 @@ class IntegratedMonitor:
                     print(f"[提示] 还有 {len(pending_tasks)} 个地址获取失败，{retry_delay}秒后重试...")
                 await asyncio.sleep(retry_delay)
             
-        # 每次都保存最新数据（覆盖旧数据）
-        self.save_balances(balances)
+        # 保存数据：保留旧缓存中未更新的数据，避免网络失败时丢失缓存
+        # 先读取现有缓存
+        current_cache = self.get_balance_cache()
+        
+        # 更新成功获取的余额
+        for address, record in balances.items():
+            current_cache[address] = record
+        
+        # 保存合并后的数据
+        self.save_balances(current_cache)
 
         return updated
 

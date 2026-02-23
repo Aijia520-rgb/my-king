@@ -177,11 +177,22 @@ async def main():
     
     import time
 
+    async def redeem_task():
+        """后台自动赎回任务 - 每小时执行一次（完全静默，不阻塞主程序）"""
+        await asyncio.sleep(300)  # 启动后等待5分钟，让主程序先稳定运行
+        while True:
+            try:
+                # 静默执行赎回（不输出INFO日志）
+                await asyncio.to_thread(auto_redeem_service.execute, silent=True)
+            except Exception as e:
+                # 只记录错误，不影响主程序
+                pass
+            # 等待1小时
+            await asyncio.sleep(3600)
+    
     async def monitor_background():
         """后台监控任务 - 每分钟更新内存变量"""
         trader_addresses = memory_monitor._load_trader_addresses()
-        # 初始化为当前时间，避免启动后立即再次触发（因为初始化阶段已经执行过一次）
-        last_redeem_time = time.time()
 
         if trader_addresses:
             # 等待60秒后开始定期监控，避免与启动时数据加载重复
@@ -189,14 +200,6 @@ async def main():
 
             while True:
                 try:
-                    # --- 自动结算逻辑 (每10分钟执行一次) ---
-                    current_time = time.time()
-                    if current_time - last_redeem_time >= 600:
-                        logger.info("[SCHEDULE] 触发定时自动结算任务...")
-                        # 在线程中运行同步的结算脚本，避免阻塞主循环
-                        await asyncio.to_thread(auto_redeem_service.execute)
-                        last_redeem_time = current_time
-                    # ---------------------------------------
 
                     # 更新余额（后台监控不显示日志）
                     await memory_monitor.update_balances(trader_addresses, show_log=False)
@@ -223,17 +226,6 @@ async def main():
 
         # 1. 并发获取并缓存交易员昵称
         await init_trader_nicknames(trader_addresses)
-
-        # --- 新增：启动前自动结算 ---
-        logger.info("[INIT] 正在执行启动前自动结算检查...")
-        try:
-            # 在线程中运行同步的结算脚本，避免阻塞事件循环
-            await asyncio.to_thread(auto_redeem_service.execute)
-            logger.info("[INIT] 启动前自动结算完成，等待 5 秒以确保状态同步...")
-            await asyncio.sleep(5)
-        except Exception as e:
-            logger.error(f"[INIT] 启动前自动结算失败 (不影响主程序启动): {e}")
-        # ---------------------------
 
         # 获取初始余额
         await memory_monitor.update_balances(trader_addresses)
@@ -285,6 +277,10 @@ async def main():
 
     # 启动后台监控任务（持续更新）
     asyncio.create_task(monitor_background())
+    
+    # 启动自动赎回后台任务（每小时执行一次，完全静默）
+    logger.info("[INIT] 启动自动赎回后台任务（每小时静默执行）...")
+    asyncio.create_task(redeem_task())
 
     # 4. 初始化交易执行服务（使用内存变量）
     logger.info("[INIT] 初始化交易执行服务...")

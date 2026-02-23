@@ -522,6 +522,15 @@ class TradeExecutionService:
         - False：继续执行后续定价/算参/下单
         """
         try:
+            # 检查交易员最小下单金额
+            min_trader_order_size = self.config.min_trader_order_size
+            if signal.amount_usdc < min_trader_order_size:
+                logger.info(
+                    f"[TRADE] 交易员下单金额 {signal.amount_usdc:.2f} USDC "
+                    f"< 最小下单金额 {min_trader_order_size:.2f} USDC，跳过该订单"
+                )
+                return True
+
             # 检查是否为大额交易，如果是则跳过 min_trade_ratio 限制
             large_order_threshold = self.config.large_order_threshold
             if signal.amount_usdc >= large_order_threshold:
@@ -1255,6 +1264,26 @@ class TradeExecutionService:
                     logger.info(f"[ORDER] 调整买入金额: {target_amount:.2f} -> {adjusted_target:.2f} USDC")
                     target_amount = adjusted_target
                     calc_details += f"\n持仓上限调整: 原{total_after_buy:.2f}超上限({limit_type})，调整为{target_amount:.2f}"
+                
+                # 检查股数限制（如果配置了）
+                if self.config.max_position_per_market_shares is not None:
+                    # 计算本次买入的股数
+                    shares_to_buy = target_amount / order_price if order_price else 0
+                    total_shares_after_buy = current_position_shares + shares_to_buy
+                    
+                    if total_shares_after_buy > self.config.max_position_per_market_shares:
+                        # 计算最大可买入股数
+                        max_shares_can_buy = self.config.max_position_per_market_shares - current_position_shares
+                        if max_shares_can_buy <= 0:
+                            msg = f"当前持仓 {current_position_shares:.2f} 股已达到股数上限 {self.config.max_position_per_market_shares} 股，跳过买入"
+                            logger.warning(f"[ORDER] {msg}")
+                            return None, calc_details, msg
+                        # 调整买入金额为不超过股数上限的金额
+                        adjusted_target = max_shares_can_buy * order_price
+                        logger.warning(f"[ORDER] 本次买入后总股数 {total_shares_after_buy:.2f} 将超过上限 {self.config.max_position_per_market_shares} 股")
+                        logger.info(f"[ORDER] 调整买入金额: {target_amount:.2f} -> {adjusted_target:.2f} USDC (最大可买 {max_shares_can_buy:.2f} 股)")
+                        target_amount = adjusted_target
+                        calc_details += f"\n股数上限调整: 最大可买{max_shares_can_buy:.2f}股，调整为{target_amount:.2f} USDC"
 
             # 5. 应用订单大小限制（买入和卖出使用不同逻辑）
             max_order_size = self.config.max_order_size  # 最大订单限制
@@ -1839,7 +1868,23 @@ class TradeExecutionService:
                     # 修复：BalanceRecord是对象，需要用.属性访问，而不是字典键访问
                     balance_record = balance_cache[target_key]
                     balance_usdc = float(balance_record.balance)
-                    logger.info(f"[BALANCE] 交易员 {trader_address[:8]}... 余额: {balance_usdc:.2f} USDC (从内存读取)")
+                    
+                    # 如果余额为0，可能是缓存过期或网络问题，尝试重新获取
+                    if balance_usdc == 0:
+                        logger.warning(f"[BALANCE] 交易员 {trader_address[:8]}... 余额为0，尝试从API重新获取...")
+                        try:
+                            await self._update_trader_balance(trader_address)
+                            # 重新从缓存读取
+                            balance_cache = self.memory_monitor.get_balance_cache()
+                            if balance_cache and target_key in balance_cache:
+                                balance_record = balance_cache[target_key]
+                                balance_usdc = float(balance_record.balance)
+                                logger.info(f"[BALANCE] 交易员 {trader_address[:8]}... 余额: {balance_usdc:.2f} USDC (重新获取)")
+                                return balance_usdc
+                        except Exception as api_e:
+                            logger.warning(f"[BALANCE] 重新获取交易员余额失败: {api_e}")
+                    else:
+                        logger.info(f"[BALANCE] 交易员 {trader_address[:8]}... 余额: {balance_usdc:.2f} USDC (从内存读取)")
                     return balance_usdc
                 else:
                     logger.warning(f"[BALANCE] 交易员 {trader_address[:8]}... 余额信息不存在于内存中，尝试从API获取...")
@@ -1917,7 +1962,23 @@ class TradeExecutionService:
                     # 修复：BalanceRecord是对象，需要用.属性访问，而不是字典键访问
                     balance_record = balance_cache[target_key]
                     balance_usdc = float(balance_record.balance)
-                    logger.info(f"[BALANCE] 我们的钱包 {our_address[:8]}... 余额: {balance_usdc:.2f} USDC (从内存读取)")
+                    
+                    # 如果余额为0，可能是缓存过期或网络问题，尝试重新获取
+                    if balance_usdc == 0:
+                        logger.warning(f"[BALANCE] 我们的钱包 {our_address[:8]}... 余额为0，尝试从API重新获取...")
+                        try:
+                            await self._fetch_and_cache_balance()
+                            # 重新从缓存读取
+                            balance_cache = self.memory_monitor.get_balance_cache()
+                            if balance_cache and target_key in balance_cache:
+                                balance_record = balance_cache[target_key]
+                                balance_usdc = float(balance_record.balance)
+                                logger.info(f"[BALANCE] 我们的钱包 {our_address[:8]}... 余额: {balance_usdc:.2f} USDC (重新获取)")
+                                return balance_usdc
+                        except Exception as api_e:
+                            logger.warning(f"[BALANCE] 重新获取我们的余额失败: {api_e}")
+                    else:
+                        logger.info(f"[BALANCE] 我们的钱包 {our_address[:8]}... 余额: {balance_usdc:.2f} USDC (从内存读取)")
                     return balance_usdc
                 else:
                     logger.warning(f"[BALANCE] 我们的钱包 {our_address[:8]}... 余额信息不存在于内存中，尝试从API获取...")

@@ -141,8 +141,13 @@ class AutoRedeemService:
             [parent_collection_id, condition_id, index_set]
         )
 
-    def redeem_position(self, position):
-        """执行单笔赎回操作"""
+    def redeem_position(self, position, silent=False):
+        """执行单笔赎回操作
+        
+        Args:
+            position: 持仓信息
+            silent: 如果为 True，则不输出 INFO 级别日志
+        """
         if not self.w3 or not self.account or not self.ctf_contract:
             logger.error("服务未正确初始化，无法执行赎回")
             return False
@@ -153,10 +158,11 @@ class AutoRedeemService:
             market_slug = position.get('slug', 'Unknown')
             size = float(position.get('size', 0))
             
-            logger.info(f"正在赎回: {market_slug}")
-            logger.info(f"  - Condition: {condition_id[:8]}...")
-            logger.info(f"  - API Index: {api_outcome_index}")
-            logger.info(f"  - Size: {size}")
+            if not silent:
+                logger.info(f"正在赎回: {market_slug}")
+                logger.info(f"  - Condition: {condition_id[:8]}...")
+                logger.info(f"  - API Index: {api_outcome_index}")
+                logger.info(f"  - Size: {size}")
             
             # ---------------------------------------------------------
             # [智能诊断与修正]
@@ -199,25 +205,25 @@ class AutoRedeemService:
             # 3. 确定要赎回的 Index Set
             target_index_sets = []
             
-            if balance_0 > 0:
-                logger.info(f"  ✅ 检测到 Index 0 持仓 (余额: {balance_0})，加入赎回列表。")
+            # 策略：当 payout=1 时（表示该 Index 获胜），即使链上余额查询为 0 也尝试赎回
+            # 这解决了 API 显示有持仓但链上余额查询失败或为 0 的问题
+            
+            if payout0 == 1:
+                logger.info(f"  🎉 Index 0 获胜！{'余额: ' + str(balance_0) if balance_0 > 0 else '余额查询为0但获胜方必须赎回'}")
                 target_index_sets.append(index_set_0)
-                if payout0 == 0:
-                    logger.warning("  ⚠️ 警告: 您持有 Index 0，但合约显示 Index 0 赔付为 0 (输了)。赎回将获得 0 USDC。")
-                else:
-                    logger.info("  🎉 恭喜: 您持有 Index 0，且 Index 0 获胜！")
+            elif balance_0 > 0:
+                logger.info(f"  ✅ 检测到 Index 0 持仓 (余额: {balance_0})，但赔付为 0 (输了)。")
+                target_index_sets.append(index_set_0)
 
-            if balance_1 > 0:
-                logger.info(f"  ✅ 检测到 Index 1 持仓 (余额: {balance_1})，加入赎回列表。")
+            if payout1 == 1:
+                logger.info(f"  🎉 Index 1 获胜！{'余额: ' + str(balance_1) if balance_1 > 0 else '余额查询为0但获胜方必须赎回'}")
                 target_index_sets.append(index_set_1)
-                if payout1 == 0:
-                    logger.warning("  ⚠️ 警告: 您持有 Index 1，但合约显示 Index 1 赔付为 0 (输了)。赎回将获得 0 USDC。")
-                else:
-                    logger.info("  🎉 恭喜: 您持有 Index 1，且 Index 1 获胜！")
+            elif balance_1 > 0:
+                logger.info(f"  ✅ 检测到 Index 1 持仓 (余额: {balance_1})，但赔付为 0 (输了)。")
+                target_index_sets.append(index_set_1)
             
             if not target_index_sets:
-                logger.warning("  ⚠️ [Critical] 链上未检测到任何余额！API 可能显示了过时数据，或者您持有的是 ERC20 包装代币而非 CTF 原生代币。")
-                # 即使没有余额，如果 API 坚持说有，我们也可以尝试用 API 的 Index (死马当活马医)，但通常没用
+                logger.warning("  ⚠️ [Critical] 未找到可赎回的 Index！")
                 logger.info(f"  尝试使用 API 提供的 Index: {api_outcome_index}")
                 target_index_sets.append(1 << api_outcome_index)
             
@@ -281,26 +287,52 @@ class AutoRedeemService:
             gas_token = "0x0000000000000000000000000000000000000000"
             refund_receiver = "0x0000000000000000000000000000000000000000"
             
-            # 获取 Safe 的 nonce
-            try:
-                nonce = self.safe_contract.functions.nonce().call()
-                logger.info(f"[Debug] Safe Nonce: {nonce}")
-            except Exception as e:
-                logger.error(f"[Debug] 获取 Safe Nonce 失败: {e}")
-                raise
+            # 获取 Safe 的 nonce - 带重试
+            nonce = None
+            for attempt in range(3):
+                try:
+                    time.sleep(3)  # 添加延迟避免限流
+                    nonce = self.safe_contract.functions.nonce().call()
+                    logger.info(f"[Debug] Safe Nonce: {nonce}")
+                    break
+                except Exception as e:
+                    if 'rate limit' in str(e).lower() or 'too many requests' in str(e).lower():
+                        if attempt < 2:
+                            wait_time = 5 * (attempt + 1)
+                            logger.warning(f"[Debug] 获取 Safe Nonce 限流，等待 {wait_time}s 后重试...")
+                            time.sleep(wait_time)
+                            continue
+                    logger.error(f"[Debug] 获取 Safe Nonce 失败: {e}")
+                    raise
+            
+            if nonce is None:
+                raise Exception("无法获取 Safe Nonce")
 
-            # 1. 获取交易哈希 (Transaction Hash)
+            # 1. 获取交易哈希 (Transaction Hash) - 带重试
             # 这是 Gnosis Safe 需要签名的内容
-            try:
-                logger.info(f"[Debug] getTransactionHash Params: to={to}, value={value}, data={data[:10]}... (len={len(data)}), op={operation}, safeTxGas={safe_tx_gas}, baseGas={base_gas}, gasPrice={gas_price}, gasToken={gas_token}, refundReceiver={refund_receiver}, nonce={nonce}")
-                
-                tx_hash_bytes = self.safe_contract.functions.getTransactionHash(
-                    to, value, data, operation, safe_tx_gas, base_gas, gas_price, gas_token, refund_receiver, nonce
-                ).call()
-                logger.info(f"[Debug] Safe Tx Hash: {tx_hash_bytes.hex()}")
-            except Exception as e:
-                logger.error(f"[Debug] getTransactionHash 调用失败: {e}")
-                raise
+            tx_hash_bytes = None
+            for attempt in range(3):
+                try:
+                    time.sleep(3)  # 添加延迟避免限流
+                    logger.info(f"[Debug] getTransactionHash Params: to={to}, value={value}, data={data[:10]}... (len={len(data)}), op={operation}, safeTxGas={safe_tx_gas}, baseGas={base_gas}, gasPrice={gas_price}, gasToken={gas_token}, refundReceiver={refund_receiver}, nonce={nonce}")
+                    
+                    tx_hash_bytes = self.safe_contract.functions.getTransactionHash(
+                        to, value, data, operation, safe_tx_gas, base_gas, gas_price, gas_token, refund_receiver, nonce
+                    ).call()
+                    logger.info(f"[Debug] Safe Tx Hash: {tx_hash_bytes.hex()}")
+                    break
+                except Exception as e:
+                    if 'rate limit' in str(e).lower() or 'too many requests' in str(e).lower():
+                        if attempt < 2:
+                            wait_time = 5 * (attempt + 1)
+                            logger.warning(f"[Debug] getTransactionHash 限流，等待 {wait_time}s 后重试...")
+                            time.sleep(wait_time)
+                            continue
+                    logger.error(f"[Debug] getTransactionHash 调用失败: {e}")
+                    raise
+            
+            if tx_hash_bytes is None:
+                raise Exception("无法获取交易哈希")
             
             # 2. 签名 (EOA Owner 签名)
             # Gnosis Safe 要求直接对交易哈希进行签名 (不加 Ethereum Signed Message 前缀)
@@ -380,27 +412,37 @@ class AutoRedeemService:
 
     def _send_transaction(self, func, gas_limit):
         """通用交易发送辅助函数"""
-        try:
-            gas_price = self.w3.eth.gas_price
-            
-            tx_params = {
-                'from': self.account.address,
-                'gas': gas_limit,
-                'gasPrice': gas_price,
-                'nonce': self.w3.eth.get_transaction_count(self.account.address),
-            }
-            
-            tx = func.build_transaction(tx_params)
-            signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=self.account.key)
-            
-            raw_tx = getattr(signed_tx, 'raw_transaction', getattr(signed_tx, 'rawTransaction', None))
-            tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
-            logger.info(f"交易已发送: {tx_hash.hex()}")
-            
-            return self._wait_for_receipt(tx_hash)
-        except Exception as e:
-            logger.error(f"发送交易失败: {e}")
-            return False
+        for attempt in range(3):
+            try:
+                time.sleep(2)  # 添加延迟避免限流
+                gas_price = self.w3.eth.gas_price
+                
+                tx_params = {
+                    'from': self.account.address,
+                    'gas': gas_limit,
+                    'gasPrice': gas_price,
+                    'nonce': self.w3.eth.get_transaction_count(self.account.address),
+                }
+                
+                tx = func.build_transaction(tx_params)
+                signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=self.account.key)
+                
+                raw_tx = getattr(signed_tx, 'raw_transaction', getattr(signed_tx, 'rawTransaction', None))
+                tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
+                logger.info(f"交易已发送: {tx_hash.hex()}")
+                
+                return self._wait_for_receipt(tx_hash)
+                
+            except Exception as e:
+                if 'rate limit' in str(e).lower() or 'too many requests' in str(e).lower():
+                    if attempt < 2:
+                        wait_time = 10 * (attempt + 1)
+                        logger.warning(f"发送交易时限流，等待 {wait_time}s 后重试... (尝试 {attempt + 1}/3)")
+                        time.sleep(wait_time)
+                        continue
+                logger.error(f"发送交易失败: {e}")
+                return False
+        return False
 
     def _wait_for_receipt(self, tx_hash):
         """等待交易确认"""
@@ -463,9 +505,14 @@ class AutoRedeemService:
             logger.error(f"等待交易确认超时或出错: {e}")
             return False
 
-    def execute(self):
-        """执行自动结算流程"""
-        logger.info("启动自动结算流程...")
+    def execute(self, silent=False):
+        """执行自动结算流程
+        
+        Args:
+            silent: 如果为 True，则不输出 INFO 级别日志（用于后台静默运行）
+        """
+        if not silent:
+            logger.info("启动自动结算流程...")
         
         if not self.w3 or not self.account:
             logger.error("Web3 或账户未初始化，无法执行")
@@ -474,27 +521,38 @@ class AutoRedeemService:
         # 获取钱包地址 (用于查询持仓)
         # 如果配置了代理钱包，则查询代理钱包的持仓；否则查询本地钱包
         wallet_address = self.config.proxy_wallet_address or self.account.address
-        logger.info(f"当前查询钱包: {wallet_address}")
+        if not silent:
+            logger.info(f"当前查询钱包: {wallet_address}")
         
         # 获取可赎回持仓
-        logger.info("正在查询可赎回持仓...")
+        if not silent:
+            logger.info("正在查询可赎回持仓...")
         redeemable_positions = self.get_redeemable_positions(wallet_address)
         
         if not redeemable_positions:
-            logger.info("当前没有可赎回的持仓。")
+            if not silent:
+                logger.info("当前没有可赎回的持仓。")
             return
             
-        logger.info(f"发现 {len(redeemable_positions)} 个可赎回持仓。")
+        if not silent:
+            logger.info(f"发现 {len(redeemable_positions)} 个可赎回持仓。")
         
         # 执行赎回
         success_count = 0
-        for pos in redeemable_positions:
-            if self.redeem_position(pos):
+        for i, pos in enumerate(redeemable_positions):
+            if not silent:
+                logger.info(f"\n处理第 {i+1}/{len(redeemable_positions)} 个持仓...")
+            if self.redeem_position(pos, silent=silent):
                 success_count += 1
-            # 简单的防速率限制
-            time.sleep(1)
+            # 多个持仓之间添加延迟，避免RPC限流
+            if i < len(redeemable_positions) - 1:
+                wait_time = 15
+                if not silent:
+                    logger.info(f"等待 {wait_time}s 后继续处理下一个持仓...")
+                time.sleep(wait_time)
             
-        logger.info(f"结算完成。成功: {success_count}/{len(redeemable_positions)}")
+        if not silent:
+            logger.info(f"结算完成。成功: {success_count}/{len(redeemable_positions)}")
 
 # 兼容旧代码的独立执行入口
 def execute_auto_redeem():

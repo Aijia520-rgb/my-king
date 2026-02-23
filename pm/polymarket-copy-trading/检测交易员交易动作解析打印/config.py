@@ -23,17 +23,17 @@ logger = setup_logger()
 
 class SecureConfig:
     """
-    安全配置类 - 从数据库加载配置，敏感数据保留在内存中方便使用
+    安全配置类 - 从.env文件加载配置，敏感数据保留在内存中方便使用
     """
     
-    def __init__(self, user_name: str = "马文哲-Test"):
+    def __init__(self) -> None:
         """
         初始化安全配置
         
         Args:
-            user_name: 数据库中的用户名称
+            (无)：不使用数据库占位名。
         """
-        self.user_name = user_name
+        # 用户名占位已移除，不再使用数据库相关配置
         self._initialized = False
         
         # 初始化所有配置属性
@@ -88,6 +88,8 @@ class SecureConfig:
         self.max_position_per_market_ratio: float = 0.1
         # 每个市场方向最大持仓金额 (USDC)，如果设置则优先使用此金额限制，否则使用比例限制
         self.max_position_per_market_amount: Optional[float] = None
+        # 每个市场方向最大持仓股数 (Shares)，如果设置则同时限制股数
+        self.max_position_per_market_shares: Optional[float] = None
         # 最小交易比例，低于此比例的交易将被忽略
         self.min_trade_ratio: float = 0.1 / 100
         # 交易员资金使用比例上限 (默认 0.1，即 10%)
@@ -95,6 +97,8 @@ class SecureConfig:
         # 例如：交易员余额1000，下单500 (50%)。如果上限设为 0.1 (10%)，
         # 我们只按 10% 的比例跟单，而不是 50%。
         self.max_trader_usage_cap: float = 0.1
+        # 交易员最小下单金额 (单位: USDC)，交易员下单低于此金额不跟单
+        self.min_trader_order_size: float = 500.0
         # 大额交易阈值 (单位: USDC)，超过此金额跳过 min_trade_ratio 限制
         self.large_order_threshold: float = 800.0
         # 买入溢价 (单位: 小数，如 0.01 表示 1%)
@@ -112,10 +116,6 @@ class SecureConfig:
         # 订单状态检查间隔 (单位: 秒)
         self.order_check_interval: int = 10
 
-        # ===== 调试配置 =====
-        # 是否开启调试日志
-        self.enable_debug_logging: bool = False
-
         
         # 敏感信息（保留在内存中，方便使用）
         # 本地钱包私钥 (请确保安全，不要分享)
@@ -127,63 +127,19 @@ class SecureConfig:
         self._account_instance = None
         self._clob_client_instance = None
         
-        self._load_config_from_database()
-    
-    def _load_config_from_database(self):
-        """从数据库加载配置"""
-        try:
-            # 延迟导入以避免循环依赖
-            from secure_tool import CryptoManager
-            
-            # 从数据库获取钱包信息
-            wallet_info = CryptoManager.get_wallet_info(self.user_name)
-            
-            if not wallet_info:
-                logger.error(f"数据库中未找到用户配置: {self.user_name}")
-                logger.info("将尝试从.env文件加载配置")
-                self._load_from_env_file()
-                return
-            
-            # 解密敏感信息（存储在内存中）
-            decrypted = CryptoManager.decrypt_wallet_info(wallet_info)
-            
-            # 存储私钥（保留在内存中，方便使用）
-            self.wallet_private_key = decrypted.get('private_key', '')
-            self._temp_decrypted_keys['private_key'] = self.wallet_private_key
-            
-            # 存储地址信息（这些可以保留，不是高度敏感信息）
-            self.local_wallet_address = decrypted.get('wallet_address', '')
-            self.proxy_wallet_address = decrypted.get('agent_address', '')
-            
-            logger.info(f"成功从数据库加载用户 {self.user_name} 的配置")
-            
-            # 从数据库加载其他配置（这里简化，实际可以从数据库扩展）
-            self._load_other_configs_from_db(wallet_info)
-            
-            self._initialized = True
-            
-        except Exception as e:
-            logger.error(f"从数据库加载配置失败: {e}")
-            logger.info("将尝试从.env文件加载配置")
-            self._load_from_env_file()
+        # 直接从.env文件加载配置
+        self._load_from_env_file()
         
         # 1. 初始化 Web3 (不清除私钥，留给下一步用)
         self.get_web3_and_account(auto_clear_key=False)
         
         # 2. 初始化 CLOB Client (最后一步，清除私钥)
         self.create_clob_client(auto_clear_key=True)
-    
 
     def reload(self):
         """重新加载配置（用于在清除敏感数据后需要再次使用时恢复）"""
         logger.info("正在重新加载配置...")
-        self._load_config_from_database()
-
-    def _load_other_configs_from_db(self, wallet_info: Dict[str, Any]):
-        """从数据库加载其他配置（扩展用）"""
-        # 这里可以扩展从数据库加载其他配置
-        # 例如：从其他配置表读取 TARGET_TRADERS 等
-        pass
+        self._load_from_env_file()
     
     def _load_from_env_file(self):
         """从.env文件加载配置（回退方案）"""
@@ -193,7 +149,7 @@ class SecureConfig:
         load_dotenv()
         # API配置
         self.gamma_api_url = os.getenv("GAMMA_API_URL", "https://gamma-api.polymarket.com")
-        self.rpc_url = os.getenv("RPC_URL", "https://polygon-rpc.com")
+        self.rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
         self.clob_base_url = os.getenv("CLOB_BASE_URL", "https://clob.polymarket.com")
         
         # 目标交易员
@@ -209,18 +165,11 @@ class SecureConfig:
         self.local_wallet_address = os.getenv("LOCAL_WALLET_ADDRESS", "")
         self.proxy_wallet_address = os.getenv("PROXY_WALLET_ADDRESS", "")
         
-        # 解密私钥（存储在内存中）
+        # 加载私钥（存储在内存中）
         raw_private_key = os.getenv("WALLET_PRIVATE_KEY", "")
         if raw_private_key:
-            try:
-                from secure_tool import CryptoManager
-                self.wallet_private_key = CryptoManager.decrypt(raw_private_key)
-                self._temp_decrypted_keys['private_key'] = self.wallet_private_key
-                logger.info("Successfully decrypted WALLET_PRIVATE_KEY")
-            except Exception as e:
-                self.wallet_private_key = raw_private_key
-                self._temp_decrypted_keys['private_key'] = self.wallet_private_key
-                logger.debug(f"Using raw WALLET_PRIVATE_KEY (decryption skipped: {str(e)})")
+            self.wallet_private_key = raw_private_key
+            self._temp_decrypted_keys['private_key'] = self.wallet_private_key
         else:
             self.wallet_private_key = ""
         
@@ -277,6 +226,15 @@ class SecureConfig:
             self.max_position_per_market_amount = None
         
         try:
+            shares_str = os.getenv("MAX_POSITION_PER_MARKET_SHARES", "")
+            if shares_str:
+                self.max_position_per_market_shares = float(shares_str)
+            else:
+                self.max_position_per_market_shares = None
+        except ValueError:
+            self.max_position_per_market_shares = None
+        
+        try:
             # 环境变量中配置的是百分比（如 0.1 表示 0.1%），需要除以 100 转换为小数
             self.min_trade_ratio = float(os.getenv("MIN_TRADE_RATIO", "0.1")) / 100.0
         except ValueError:
@@ -286,6 +244,11 @@ class SecureConfig:
             self.max_trader_usage_cap = float(os.getenv("MAX_TRADER_USAGE_CAP", "0.1"))
         except ValueError:
             self.max_trader_usage_cap = 0.1
+        
+        try:
+            self.min_trader_order_size = float(os.getenv("MIN_TRADER_ORDER_SIZE", "500.0"))
+        except ValueError:
+            self.min_trader_order_size = 500.0
         
         try:
             self.large_order_threshold = float(os.getenv("LARGE_ORDER_THRESHOLD", "800.0"))
@@ -323,9 +286,6 @@ class SecureConfig:
             self.order_check_interval = int(os.getenv("ORDER_CHECK_INTERVAL", "10"))
         except ValueError:
             self.order_check_interval = 10
-        
-        # 调试配置
-        self.enable_debug_logging = os.getenv("ENABLE_DEBUG_LOGGING", "false").lower() == "true"
         
         # 交易员配置
         try:
@@ -515,11 +475,11 @@ class SecureConfig:
 # 全局配置实例
 _config_instance = None
 
-def get_config(user_name: str = "马文哲-Test") -> SecureConfig:
+def get_config() -> SecureConfig:
     """获取全局配置实例"""
     global _config_instance
     if _config_instance is None:
-        _config_instance = SecureConfig(user_name=user_name)
+        _config_instance = SecureConfig()
     return _config_instance
 
 # 为了向后兼容，创建 Config 别名
