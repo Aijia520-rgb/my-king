@@ -26,36 +26,22 @@ class SecureConfig:
     安全配置类 - 从.env文件加载配置，敏感数据保留在内存中方便使用
     """
     
-    def __init__(self) -> None:
-        """
-        初始化安全配置
-        
-        Args:
-            (无)：不使用数据库占位名。
-        """
-        # 用户名占位已移除，不再使用数据库相关配置
+    def __init__(self):
+        """初始化安全配置"""
         self._initialized = False
         
         # 初始化所有配置属性
         # ===== Gamma API配置 (用于市场信息) =====
-        # Gamma API 的基础 URL，用于获取市场信息
         self.gamma_api_url: str = "https://gamma-api.polymarket.com"
 
         # ===== RPC配置 =====
-        # Polygon主网Infura RPC节点 (提供更稳定的网络连接)
-        self.rpc_url: str = "https://polygon-mainnet.infura.io/v3/42095394bf684578b4e9d78c53f721f1"
+        self.rpc_url: str = "https://polygon-mainnet.infura.io/v3/f86eb30a36a147fb9eb117314407dfb6"
         
         # ===== 目标交易员配置 =====
-        # 需要监控的目标交易员地址列表
-        self.target_traders: List[str] = [""
-                                          ]
-        # self.target_traders: List[str] = ["0xCf2EAeAaB60579cd9d5750b5FF37a29F7d92c972"]
-        # 针对特定交易员的个性化配置（如跟单比例）
+        self.target_traders: List[str] = []
         self.trader_configs: Dict[str, Any] = {}
 
-
         # ===== CLOB API配置 =====
-        # CLOB (Central Limit Order Book) API 的基础 URL，用于下单
         self.clob_base_url: str = "https://clob.polymarket.com"
         
         # 网络链ID (137: Polygon mainnet, 80002: Amoy testnet)
@@ -70,55 +56,37 @@ class SecureConfig:
         self.proxy_wallet_address: str = ""
 
         # ===== 交易策略配置 =====
-        # 跟单比例 (例如 0.1 表示跟随目标交易员 10% 的金额)
         self.copy_ratio: float = 0.3
-        # 订单超时时间 (单位: 秒)
-        self.order_timeout: int = 300
-        # 信号过期时间 (单位: 秒)，超过此时间的交易信号将被忽略
+        self.order_expiry_seconds: int = 300
         self.signal_expiry: int = 60
-        # 最大单笔订单金额 (单位: USDC)
+        self.buy_order_type: str = "GTD"
+        self.sell_order_type: str = "FOK"
         self.max_order_size: float = 10000
-        # 最小单笔订单金额 (单位: USDC)
         self.min_order_size: Optional[float] = None
 
         # ===== 风险控制配置 =====
-        # 最大持仓金额 (单位: USDC)，超过此金额将不再开仓
         self.max_position_size: float = 50000
-        # 每个市场方向最大持仓比例 (相对于我们可用余额的比例，如 0.1 表示 10%)
-        self.max_position_per_market_ratio: float = 0.1
-        # 每个市场方向最大持仓金额 (USDC)，如果设置则优先使用此金额限制，否则使用比例限制
-        self.max_position_per_market_amount: Optional[float] = None
-        # 每个市场方向最大持仓股数 (Shares)，如果设置则同时限制股数
-        self.max_position_per_market_shares: Optional[float] = None
-        # 最小交易比例，低于此比例的交易将被忽略
         self.min_trade_ratio: float = 0.1 / 100
-        # 交易员资金使用比例上限 (默认 0.1，即 10%)
-        # 如果交易员单笔交易使用了超过其余额的 10%，我们按此上限计算跟单金额
-        # 例如：交易员余额1000，下单500 (50%)。如果上限设为 0.1 (10%)，
-        # 我们只按 10% 的比例跟单，而不是 50%。
         self.max_trader_usage_cap: float = 0.1
-        # 交易员最小下单金额 (单位: USDC)，交易员下单低于此金额不跟单
-        self.min_trader_order_size: float = 500.0
-        # 大额交易阈值 (单位: USDC)，超过此金额跳过 min_trade_ratio 限制
-        self.large_order_threshold: float = 800.0
-        # 买入溢价 (单位: 小数，如 0.01 表示 1%)
-        self.buy_premium: float = 0.01
-        # 卖出折价 (单位: 小数，如 0.01 表示 1%)
-        self.sell_premium: float = 0.02
-        # 市场标题黑名单（不跟单的市场标题列表）
-        self.market_title_blacklist: List[str] = []
-        # 交易失败后的最大重试次数
         self.max_retry_attempts: int = 3
-        # 重试间隔时间 (单位: 秒)
         self.retry_delay: float = 1.0
+        self.market_title_blacklist: List[str] = []
+        self.buy_premium: float = 0.01
+        self.sell_premium: float = 0.02
+        self.max_price_threshold: float = 0.98
+        self.large_order_threshold: float = 1000
+        self.min_trader_order_size: float = 500
+        self.max_position_per_market_ratio: float = 0.1
+        self.max_position_per_market_amount: Optional[float] = None
+        self.max_position_per_market_shares: Optional[float] = None
 
         # ===== 监控配置 =====
-        # 订单状态检查间隔 (单位: 秒)
         self.order_check_interval: int = 10
 
-        
+        # ===== 调试配置 =====
+        self.enable_debug_logging: bool = False
+
         # 敏感信息（保留在内存中，方便使用）
-        # 本地钱包私钥 (请确保安全，不要分享)
         self.wallet_private_key: str = ""
         self._temp_decrypted_keys: Dict[str, str] = {}
         
@@ -127,17 +95,11 @@ class SecureConfig:
         self._account_instance = None
         self._clob_client_instance = None
         
-        # 直接从.env文件加载配置
+        # 从 .env 文件加载配置
         self._load_from_env_file()
-        
-        # 1. 初始化 Web3 (不清除私钥，留给下一步用)
-        self.get_web3_and_account(auto_clear_key=False)
-        
-        # 2. 初始化 CLOB Client (最后一步，清除私钥)
-        self.create_clob_client(auto_clear_key=True)
-
+    
     def reload(self):
-        """重新加载配置（用于在清除敏感数据后需要再次使用时恢复）"""
+        """重新加载配置"""
         logger.info("正在重新加载配置...")
         self._load_from_env_file()
     
@@ -149,7 +111,7 @@ class SecureConfig:
         load_dotenv()
         # API配置
         self.gamma_api_url = os.getenv("GAMMA_API_URL", "https://gamma-api.polymarket.com")
-        self.rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+        self.rpc_url = os.getenv("POLYGON_RPC_URL", os.getenv("RPC_URL", "https://polygon-rpc.com"))
         self.clob_base_url = os.getenv("CLOB_BASE_URL", "https://clob.polymarket.com")
         
         # 目标交易员
@@ -165,11 +127,18 @@ class SecureConfig:
         self.local_wallet_address = os.getenv("LOCAL_WALLET_ADDRESS", "")
         self.proxy_wallet_address = os.getenv("PROXY_WALLET_ADDRESS", "")
         
-        # 加载私钥（存储在内存中）
+        # 解密私钥（存储在内存中）
         raw_private_key = os.getenv("WALLET_PRIVATE_KEY", "")
         if raw_private_key:
-            self.wallet_private_key = raw_private_key
-            self._temp_decrypted_keys['private_key'] = self.wallet_private_key
+            try:
+                from secure_tool import CryptoManager
+                self.wallet_private_key = CryptoManager.decrypt(raw_private_key)
+                self._temp_decrypted_keys['private_key'] = self.wallet_private_key
+                logger.info("Successfully decrypted WALLET_PRIVATE_KEY")
+            except Exception as e:
+                self.wallet_private_key = raw_private_key
+                self._temp_decrypted_keys['private_key'] = self.wallet_private_key
+                logger.debug(f"Using raw WALLET_PRIVATE_KEY (decryption skipped: {str(e)})")
         else:
             self.wallet_private_key = ""
         
@@ -182,14 +151,28 @@ class SecureConfig:
             logger.warning("Invalid COPY_RATIO, using default 0.1")
         
         try:
-            self.order_timeout = int(os.getenv("ORDER_TIMEOUT", "300"))
+            self.order_expiry_seconds = int(os.getenv("ORDER_EXPIRY_SECONDS", "300"))
         except ValueError:
-            self.order_timeout = 300
+            self.order_expiry_seconds = 300
         
         try:
             self.signal_expiry = int(os.getenv("SIGNAL_EXPIRY", "60"))
         except ValueError:
             self.signal_expiry = 60
+        
+        # 买入订单类型
+        buy_order_type = os.getenv("BUY_ORDER_TYPE", "GTD").upper()
+        if buy_order_type not in ["GTD", "FOK", "FAK", "GTC"]:
+            logger.warning(f"Invalid BUY_ORDER_TYPE '{buy_order_type}', using default GTD")
+            buy_order_type = "GTD"
+        self.buy_order_type = buy_order_type
+        
+        # 卖出订单类型
+        sell_order_type = os.getenv("SELL_ORDER_TYPE", "FOK").upper()
+        if sell_order_type not in ["GTD", "FOK", "FAK", "GTC"]:
+            logger.warning(f"Invalid SELL_ORDER_TYPE '{sell_order_type}', using default FOK")
+            sell_order_type = "FOK"
+        self.sell_order_type = sell_order_type
         
         try:
             self.max_order_size = float(os.getenv("MAX_ORDER_SIZE", "10000"))
@@ -212,29 +195,6 @@ class SecureConfig:
             self.max_position_size = 50000
         
         try:
-            self.max_position_per_market_ratio = float(os.getenv("MAX_POSITION_PER_MARKET_RATIO", "0.1"))
-        except ValueError:
-            self.max_position_per_market_ratio = 0.1
-        
-        try:
-            amount_str = os.getenv("MAX_POSITION_PER_MARKET_AMOUNT", "")
-            if amount_str:
-                self.max_position_per_market_amount = float(amount_str)
-            else:
-                self.max_position_per_market_amount = None
-        except ValueError:
-            self.max_position_per_market_amount = None
-        
-        try:
-            shares_str = os.getenv("MAX_POSITION_PER_MARKET_SHARES", "")
-            if shares_str:
-                self.max_position_per_market_shares = float(shares_str)
-            else:
-                self.max_position_per_market_shares = None
-        except ValueError:
-            self.max_position_per_market_shares = None
-        
-        try:
             # 环境变量中配置的是百分比（如 0.1 表示 0.1%），需要除以 100 转换为小数
             self.min_trade_ratio = float(os.getenv("MIN_TRADE_RATIO", "0.1")) / 100.0
         except ValueError:
@@ -244,32 +204,6 @@ class SecureConfig:
             self.max_trader_usage_cap = float(os.getenv("MAX_TRADER_USAGE_CAP", "0.1"))
         except ValueError:
             self.max_trader_usage_cap = 0.1
-        
-        try:
-            self.min_trader_order_size = float(os.getenv("MIN_TRADER_ORDER_SIZE", "500.0"))
-        except ValueError:
-            self.min_trader_order_size = 500.0
-        
-        try:
-            self.large_order_threshold = float(os.getenv("LARGE_ORDER_THRESHOLD", "800.0"))
-        except ValueError:
-            self.large_order_threshold = 800.0
-        
-        try:
-            self.buy_premium = float(os.getenv("BUY_PREMIUM", "0.01"))
-        except ValueError:
-            self.buy_premium = 0.01
-        
-        try:
-            self.sell_premium = float(os.getenv("SELL_PREMIUM", "0.01"))
-        except ValueError:
-            self.sell_premium = 0.01
-        
-        try:
-            self.market_title_blacklist = json.loads(os.getenv("MARKET_TITLE_BLACKLIST", "[]"))
-        except json.JSONDecodeError:
-            logger.warning("MARKET_TITLE_BLACKLIST in .env is not a valid JSON list. Using empty list.")
-            self.market_title_blacklist = []
 
         # 重试配置
         try:
@@ -287,6 +221,69 @@ class SecureConfig:
         except ValueError:
             self.order_check_interval = 10
         
+        # 市场标题黑名单
+        try:
+            self.market_title_blacklist = json.loads(os.getenv("MARKET_TITLE_BLACKLIST", "[]"))
+        except json.JSONDecodeError:
+            self.market_title_blacklist = []
+        
+        # 买入溢价
+        try:
+            self.buy_premium = float(os.getenv("BUY_PREMIUM", "0.01"))
+        except ValueError:
+            self.buy_premium = 0.01
+        
+        # 卖出折价
+        try:
+            self.sell_premium = float(os.getenv("SELL_PREMIUM", "0.02"))
+        except ValueError:
+            self.sell_premium = 0.02
+        
+        # 最高跟单价格
+        try:
+            self.max_price_threshold = float(os.getenv("MAX_PRICE_THRESHOLD", "0.98"))
+        except ValueError:
+            self.max_price_threshold = 0.98
+        
+        # 大额交易阈值
+        try:
+            self.large_order_threshold = float(os.getenv("LARGE_ORDER_THRESHOLD", "1000"))
+        except ValueError:
+            self.large_order_threshold = 1000
+        
+        # 交易员最小下单金额
+        try:
+            self.min_trader_order_size = float(os.getenv("MIN_TRADER_ORDER_SIZE", "500"))
+        except ValueError:
+            self.min_trader_order_size = 500
+        
+        # 每个市场持仓限制
+        try:
+            self.max_position_per_market_ratio = float(os.getenv("MAX_POSITION_PER_MARKET_RATIO", "0.1"))
+        except ValueError:
+            self.max_position_per_market_ratio = 0.1
+        
+        max_position_per_market_amount_env = os.getenv("MAX_POSITION_PER_MARKET_AMOUNT", "").strip()
+        if max_position_per_market_amount_env == "":
+            self.max_position_per_market_amount = None
+        else:
+            try:
+                self.max_position_per_market_amount = float(max_position_per_market_amount_env)
+            except ValueError:
+                self.max_position_per_market_amount = None
+        
+        max_position_per_market_shares_env = os.getenv("MAX_POSITION_PER_MARKET_SHARES", "").strip()
+        if max_position_per_market_shares_env == "":
+            self.max_position_per_market_shares = None
+        else:
+            try:
+                self.max_position_per_market_shares = float(max_position_per_market_shares_env)
+            except ValueError:
+                self.max_position_per_market_shares = None
+        
+        # 调试配置
+        self.enable_debug_logging = os.getenv("ENABLE_DEBUG_LOGGING", "false").lower() == "true"
+        
         # 交易员配置
         try:
             self.trader_configs = json.loads(os.getenv("TRADER_CONFIGS", "{}"))
@@ -294,6 +291,10 @@ class SecureConfig:
         except json.JSONDecodeError:
             logger.warning("TRADER_CONFIGS in .env is not a valid JSON. Using empty config.")
             self.trader_configs = {}
+        
+        # 初始化 Web3 和 ClobClient
+        self.get_web3_and_account(auto_clear_key=False)
+        self.create_clob_client(auto_clear_key=True)
         
         self._initialized = True
     
@@ -343,7 +344,7 @@ class SecureConfig:
         return {
             "copy_ratio": self.copy_ratio,
             "trader_configs": self.trader_configs,
-            "order_timeout": self.order_timeout,
+            "order_expiry_seconds": self.order_expiry_seconds,
             "signal_expiry": self.signal_expiry,
             "max_order_size": self.max_order_size,
             "min_order_size": self.min_order_size,

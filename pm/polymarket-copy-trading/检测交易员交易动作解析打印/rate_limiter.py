@@ -14,13 +14,13 @@ class RateLimiter:
             cls._instance = super(RateLimiter, cls).__new__(cls)
         return cls._instance
 
-    def __init__(self, rate=18, capacity=190):
+    def __init__(self, rate=14, capacity=140):
         """
         初始化限流器
         
         Args:
-            rate: 填充速率 (令牌/秒)。默认 18 (即 180 req/10s，略低于官方 200 req/10s)
-            capacity: 桶容量。默认 190
+            rate: 填充速率 (令牌/秒)。默认 14 (略低于 /positions 的 15 req/s)
+            capacity: 桶容量。默认 140
         """
         if not hasattr(self, 'initialized'):
             self.rate = rate

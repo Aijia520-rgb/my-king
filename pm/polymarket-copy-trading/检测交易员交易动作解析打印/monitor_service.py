@@ -9,14 +9,14 @@ from rate_limiter import global_rate_limiter
 TRADER_NICKNAME_CACHE: dict = {}
 
 def get_trader_display_info(trader_address: str) -> str:
-    """获取交易员显示信息（昵称或地址）"""
+    """获取交易员显示信息（昵称或完整地址）"""
     if not trader_address:
         return "未知交易员"
     
     trader_address = trader_address.lower()
     if trader_address in TRADER_NICKNAME_CACHE:
-        return f"{TRADER_NICKNAME_CACHE[trader_address]} ({trader_address[:6]}...)"
-    return f"{trader_address[:6]}..."
+        return f"{TRADER_NICKNAME_CACHE[trader_address]} ({trader_address})"
+    return trader_address
 
 class MonitorService:
     def __init__(self, decoder_service, enrichment_service):
@@ -33,8 +33,9 @@ class MonitorService:
 
         # Polymarket API配置
         self.api_url = "https://data-api.polymarket.com/activity"
+        self.session = None  # 复用HTTP session
         
-        # API频率限制配置 (10秒190次 => 19次/秒)
+        # API频率限制配置 (10秒140次 => 14次/秒)
         self.rate_limit_10s = 190
         self.safety_margin = 0.9   # 降低频率：从 1.0 降至 0.5，避免 429
         self.target_total_rps = (self.rate_limit_10s / 10.0) * self.safety_margin
@@ -72,7 +73,7 @@ class MonitorService:
                 # 当 price 接近 1（例如 0.999）时，`:.2f` 会显示成 1.00，容易误判为“交易员价格=1.0”。
                 # 下单侧会使用更高精度（建议 >= 6 位小数）打印并严格 clamp 到服务端允许区间。
                 logger.info(f"\n[检测到新交易] {actual_trade_data['side']} {actual_trade_data['sizeUsd']:.2f} USD")
-                logger.info(f"   交易员: {get_trader_display_info(actual_trade_data['trader'])}")
+                logger.info(f"   交易员: {actual_trade_data['trader']}")
                 logger.info(f"   代币ID: {actual_trade_data['tokenId']}")
                 logger.info(f"   市场ID: {actual_trade_data['marketId']}")
                 logger.info(f"   预测结果: {market_info['outcome']}")
@@ -112,6 +113,9 @@ class MonitorService:
         """启动API轮询监控"""
         self.running = True
         
+        # 创建复用的HTTP session
+        self.session = aiohttp.ClientSession()
+        
         # 动态计算最优轮询间隔
         trader_count = len(self.config.target_traders)
         # 使用全局限流器控制频率，这里不再需要复杂的计算
@@ -131,8 +135,12 @@ class MonitorService:
             logger.info(f"   {i}. {get_trader_display_info(addr)}")
         logger.info("="*80 + "\n")
 
+        # 启动队列处理器
+        self.queue_processor_task = asyncio.create_task(self.process_trade_queue())
+        logger.info("[MONITOR] 交易队列处理器已启动")
+
         # 为每个交易员创建监控任务
-        tasks = []
+        tasks = [self.queue_processor_task]
         # 计算错峰启动的延迟步长，使请求均匀分布在时间轴上
         delay_step = self.fetch_interval / trader_count if trader_count > 0 else 0
         
@@ -286,6 +294,10 @@ class MonitorService:
             await self.trade_queue.put(None)  # 发送停止信号
             await self.queue_processor_task
 
+        # 关闭HTTP session
+        if self.session:
+            await self.session.close()
+
         logger.info("[MONITOR] API监控服务已停止")
 
     async def monitor_trader(self, trader, initial_delay=0.0):
@@ -315,67 +327,66 @@ class MonitorService:
             # 获取令牌 (限流)
             await global_rate_limiter.acquire()
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as response:
-                    if response.status == 200:
-                        activities = await response.json()
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    activities = await response.json()
 
-                        now = int(datetime.now().timestamp())
-                        cutoff_time = now - self.aggregation_window
+                    now = int(datetime.now().timestamp())
+                    cutoff_time = now - self.aggregation_window
 
-                        # 统计变量
-                        trade_count = 0
-                        skipped_old = 0
-                        skipped_processed = 0
-                        skipped_before_last = 0
+                    # 统计变量
+                    trade_count = 0
+                    skipped_old = 0
+                    skipped_processed = 0
+                    skipped_before_last = 0
 
-                        for activity in activities:
-                            if activity.get('type') != 'TRADE':
-                                continue
-                            trade_count += 1
+                    for activity in activities:
+                        if activity.get('type') != 'TRADE':
+                            continue
+                        trade_count += 1
 
-                            # 处理时间戳
-                            activity_time = self._get_timestamp(activity)
+                        # 处理时间戳
+                        activity_time = self._get_timestamp(activity)
 
-                            if activity_time < cutoff_time:
-                                skipped_old += 1
-                                continue
+                        if activity_time < cutoff_time:
+                            skipped_old += 1
+                            continue
 
-                            # 检查是否已处理
-                            tx_hash = activity.get('transactionHash')
-                            if tx_hash in self.processed_hashes:
-                                skipped_processed += 1
-                                continue
+                        # 检查是否已处理
+                        tx_hash = activity.get('transactionHash')
+                        if tx_hash in self.processed_hashes:
+                            skipped_processed += 1
+                            continue
 
-                            # 检查是否在最后获取时间之前
-                            last_time = self.last_fetch_time.get(trader, 0)
-                            if activity_time <= last_time:
-                                skipped_before_last += 1
-                                continue
+                        # 检查是否在最后获取时间之前
+                        last_time = self.last_fetch_time.get(trader, 0)
+                        if activity_time <= last_time:
+                            skipped_before_last += 1
+                            continue
 
-                            # 检测到新交易
-                            await self._process_trade(activity, trader)
+                        # 检测到新交易
+                        await self._process_trade(activity, trader)
 
-                            # 记录处理状态
-                            self.processed_hashes.add(tx_hash)
-                            self.last_fetch_time[trader] = max(
-                                self.last_fetch_time.get(trader, 0),
-                                activity_time
-                            )
+                        # 记录处理状态
+                        self.processed_hashes.add(tx_hash)
+                        self.last_fetch_time[trader] = max(
+                            self.last_fetch_time.get(trader, 0),
+                            activity_time
+                        )
 
-                        # 只在有新交易时显示状态
-                        new_trades = trade_count - skipped_old - skipped_processed - skipped_before_last
-                        if new_trades > 0:
-                            logger.info(f"[MONITOR] {trader[:10]}...: 发现 {new_trades} 笔新交易 "
-                                      f"(总计: {trade_count}, 跳过: {skipped_old + skipped_processed + skipped_before_last})")
+                    # 只在有新交易时显示状态
+                    new_trades = trade_count - skipped_old - skipped_processed - skipped_before_last
+                    if new_trades > 0:
+                        logger.info(f"[MONITOR] {trader[:10]}...: 发现 {new_trades} 笔新交易 "
+                                  f"(总计: {trade_count}, 跳过: {skipped_old + skipped_processed + skipped_before_last})")
 
-                    elif response.status == 404:
-                        logger.info(f"[MONITOR] 交易员 {trader[:10]}... 无活动记录 (404)")
-                    elif response.status == 429:
-                        logger.warning(f"[MONITOR] 触发API频率限制 (429)，暂停 5 秒...")
-                        await asyncio.sleep(5)
-                    else:
-                        logger.warning(f"[MONITOR] API请求失败，状态码: {response.status}")
+                elif response.status == 404:
+                    logger.info(f"[MONITOR] 交易员 {trader[:10]}... 无活动记录 (404)")
+                elif response.status == 429:
+                    logger.warning(f"[MONITOR] 触发API频率限制 (429)，暂停 5 秒...")
+                    await asyncio.sleep(5)
+                else:
+                    logger.warning(f"[MONITOR] API请求失败，状态码: {response.status}")
 
         except asyncio.TimeoutError:
             logger.warning(f"[MONITOR] 请求超时: {trader[:10]}...")

@@ -33,8 +33,8 @@ def get_trader_display_info(trader_address: str) -> str:
     
     trader_address = trader_address.lower()
     if trader_address in TRADER_NICKNAME_CACHE:
-        return f"{TRADER_NICKNAME_CACHE[trader_address]} ({trader_address[:6]}...)"
-    return f"{trader_address[:6]}..."
+        return f"{TRADER_NICKNAME_CACHE[trader_address]} ({trader_address})"
+    return trader_address
 
 # Polymarket CLOB client
 try:
@@ -57,7 +57,7 @@ except ImportError as e:
         pass
     class MarketOrderArgs:
         pass
-    ClobOrderType = type('ClobOrderType', (), {'GTC': 'GTC', 'FOK': 'FOK'})
+    ClobOrderType = type('ClobOrderType', (), {'GTC': 'GTC', 'FOK': 'FOK', 'FAK': 'FAK', 'GTD': 'GTD'})
     BUY = 'BUY'
     SELL = 'SELL'
 
@@ -133,7 +133,6 @@ class TradeExecutionService:
 
         # 策略配置
         self.copy_ratio = config.copy_ratio
-        self.order_timeout = config.order_timeout
         self.signal_expiry = config.signal_expiry
 
         # HTTP会话 (支持HTTP/2)
@@ -143,7 +142,6 @@ class TradeExecutionService:
         logger.info(f"[TRADE] 使用钱包类型: {self.wallet_type}")
         logger.info(f"[TRADE] 当前钱包地址: {self.proxy_wallet}")
         logger.info(f"[TRADE] 跟单比例: {self.copy_ratio}")
-        logger.info(f"[TRADE] 订单超时: {self.order_timeout}秒")
         logger.info(f"[TRADE] 信号有效期: {self.signal_expiry}秒")
 
     async def start(self):
@@ -333,23 +331,7 @@ class TradeExecutionService:
                 await self._update_positions_after_trade(signal)
                 return False
 
-            # 5.1 缓存挂单：用于5分钟后检查未成交/部分成交并撤单
-            try:
-                if self.memory_monitor and hasattr(self.memory_monitor, "cache_open_order"):
-                    self.memory_monitor.cache_open_order(
-                        order_id=order_id,
-                        token_id=signal.token_id,
-                        side=signal.side,
-                        created_at=time.time(),
-                        delay_seconds=300,  # 按需求：5分钟后检查
-                    )
-            except Exception as e:
-                logger.warning(f"[ORDER-CACHE] 缓存挂单失败: {e}")
-
-            # 6. 启动订单管理任务
-            asyncio.create_task(self._manage_order_lifecycle(order_id, signal))
-
-            # 7. 记录处理状态
+            # 6. 记录处理状态
             self.processed_signals.add(signal.original_tx_hash)
 
             logger.info(f"[TRADE] 跟单信号处理成功，订单ID: {order_id}")
@@ -785,6 +767,10 @@ class TradeExecutionService:
             price_f = float(trader_price)
             
             if side == "BUY":
+                if price_f >= self.config.max_price_threshold:
+                    logger.info(f"[PRICE] BUY 跳过: trader_price={price_f:.6f} >= max_price_threshold={self.config.max_price_threshold}")
+                    return None
+                
                 if price_f > 0.99:
                     logger.info(f"[PRICE] BUY 跳过: trader_price={price_f:.6f} > 0.99")
                     return None
@@ -1072,7 +1058,6 @@ class TradeExecutionService:
         """
         try:
             # 3. 智能跟单策略：根据买卖类型使用不同逻辑
-            use_market_order = False  # 默认为限价单
             calc_details = "" # 计算过程描述
             error_reason = None # 错误原因
 
@@ -1115,13 +1100,11 @@ class TradeExecutionService:
                 calc_details = f"卖出比例: {sell_ratio*100:.2f}% (交易员卖出{float(trader_sold or 0):.2f}/持仓{trader_total:.2f})"
 
                 # 策略分支：
-                # 1. 如果当前总持仓 < 5 股（零头），则直接使用市价单清仓
-                # 2. 如果当前总持仓 >= 5 股，则按比例卖出，且最小卖出 5 股（使用限价单）
+                # 根据配置决定是否使用市价单，零头持仓强制市价清仓
                 
                 if our_position_shares < 5.0:
-                    logger.info(f"[ORDER] 当前持仓 {our_position_shares:.4f} < 5，属于零头，使用市价单 (Market Order) 清仓")
+                    logger.info(f"[ORDER] 当前持仓 {our_position_shares:.4f} < 5，属于零头，使用市价单清仓")
                     our_sell_shares = our_position_shares
-                    use_market_order = True
                     calc_details += f"\n策略: 零头清仓 (持仓{our_position_shares:.2f}<5)"
                 else:
                     # 计算我们的卖出股数
@@ -1138,7 +1121,6 @@ class TradeExecutionService:
                     if our_sell_shares > our_position_shares:
                         our_sell_shares = our_position_shares
                     
-                    use_market_order = False
                     calc_details += f"\n最终卖出: {our_sell_shares:.2f}股"
 
                 target_amount = our_sell_shares * order_price if order_price else 0
@@ -1380,6 +1362,17 @@ class TradeExecutionService:
             if signal.side == "SELL":
                 logger.info(f"[ORDER] 卖出订单股数: {shares:.2f} 股 (基于金额 {order_amount:.2f} USDC)")
 
+            # 根据配置决定订单类型
+            if signal.side == "BUY":
+                order_type = self.config.buy_order_type
+            else:
+                order_type = self.config.sell_order_type
+            
+            # 判断是否为市价单类型
+            is_market_order = order_type in ["FOK", "FAK"]
+            
+            logger.info(f"[ORDER] 订单类型: {order_type} ({'市价单' if is_market_order else '限价单'})")
+
             # 构建订单参数
             order_params = {
                 'token_id': signal.token_id,
@@ -1387,9 +1380,9 @@ class TradeExecutionService:
                 'price': order_price,
                 'size': order_amount,  # 金额（USDC）
                 'shares': shares,  # 股数（卖出时直接使用持仓股数）
-                'order_type': 'MARKET' if use_market_order else 'GTC',  # 根据情况选择订单类型
+                'order_type': 'MARKET' if is_market_order else order_type,  # 根据配置选择订单类型
                 'reduce_only': False,
-                'time_in_force': 'FOK' if use_market_order else 'GTC', # 市价单通常使用 FOK
+                'time_in_force': order_type,  # FOK/FAK/GTD/GTC
                 'client_order_id': f"copy_{int(time.time())}_{signal.original_tx_hash[:8]}"
             }
 
@@ -1518,12 +1511,28 @@ class TradeExecutionService:
                 logger.info(f"[PLACE] 构建市价单参数: {shares} 股")
             else:
                 # 限价单参数
-                order_args = OrderArgs(
-                    token_id=order_params['token_id'],
-                    price=price,
-                    size=shares,
-                    side=side,
-                )
+                time_in_force = order_params.get('time_in_force', 'GTD')
+                
+                if time_in_force == 'GTD':
+                    # GTD 订单需要设置过期时间
+                    expiration_timestamp = int(time.time()) + 60 + self.config.order_expiry_seconds
+                    order_args = OrderArgs(
+                        token_id=order_params['token_id'],
+                        price=price,
+                        size=shares,
+                        side=side,
+                        expiration=expiration_timestamp,
+                    )
+                    logger.info(f"[PLACE] 构建GTD限价单参数: {shares} 股, 过期时间: {expiration_timestamp} (有效期: {self.config.order_expiry_seconds}秒)")
+                else:
+                    # GTC 订单不需要设置过期时间
+                    order_args = OrderArgs(
+                        token_id=order_params['token_id'],
+                        price=price,
+                        size=shares,
+                        side=side,
+                    )
+                    logger.info(f"[PLACE] 构建GTC限价单参数: {shares} 股")
 
             # ===== 下单入参打印（用于排查“到底提交了什么”）=====
             try:
@@ -1601,11 +1610,20 @@ class TradeExecutionService:
 
             # 直接使用post_order提交（quick_sell.py成功方式）
             try:
-                if order_params.get('order_type') == 'MARKET':
+                order_type = order_params.get('time_in_force', 'GTD')
+                if order_type == 'FOK':
                     resp = await asyncio.to_thread(client.post_order, signed_order, ClobOrderType.FOK)
+                    logger.info(f"[PLACE] 订单提交成功 (FOK市价单)")
+                elif order_type == 'FAK':
+                    resp = await asyncio.to_thread(client.post_order, signed_order, ClobOrderType.FAK)
+                    logger.info(f"[PLACE] 订单提交成功 (FAK市价单)")
+                elif order_type == 'GTC':
+                    resp = await asyncio.to_thread(client.post_order, signed_order, ClobOrderType.GTC)
+                    logger.info(f"[PLACE] 订单提交成功 (GTC限价单，需手动撤单)")
                 else:
-                    resp = await asyncio.to_thread(client.post_order, signed_order)
-                logger.info(f"[PLACE] 订单提交成功")
+                    # 默认使用 GTD 订单类型（平台自动撤单）
+                    resp = await asyncio.to_thread(client.post_order, signed_order, ClobOrderType.GTD)
+                    logger.info(f"[PLACE] 订单提交成功 (GTD限价单，平台自动撤单)")
                 try:
                     logger.info(
                         "[PLACE-PAYLOAD] post_order_resp="
@@ -1615,6 +1633,9 @@ class TradeExecutionService:
                     logger.info(f"[PLACE-PAYLOAD] post_order_resp(type)={type(resp)} value={resp}")
             except Exception as e:
                 logger.error(f"[PLACE] 订单提交失败: {e}")
+                logger.error(f"[PLACE] 异常类型: {type(e).__name__}")
+                import traceback
+                logger.error(f"[PLACE] 堆栈跟踪: {traceback.format_exc()}")
                 return None
 
             # 使用quick_sell.py的响应判断逻辑
@@ -1661,12 +1682,11 @@ class TradeExecutionService:
                     price=price,
                     created_at=time.time(),
                     status='pending',
-                    expires_at=time.time() + self.order_timeout,
+                    expires_at=time.time() + self.config.order_expiry_seconds,
                     original_signal=order_params['client_order_id']
                 )
 
-                # 关键修复：返回 order_id（供订单生命周期管理/撤单使用）
-                # 同时返回 taking_amount 用于判断是否立即成交
+                # 返回 order_id 和 taking_amount
                 return order_id, taking_amount
             else:
                 logger.error(f"[PLACE] 实盘下单失败: {resp}")
@@ -1690,150 +1710,6 @@ class TradeExecutionService:
                 logger.error(f"[PLACE] 下单失败: {e}", exc_info=True)
 
             return None
-
-    async def _manage_order_lifecycle(self, order_id, signal):
-        """管理订单生命周期"""
-        try:
-            logger.info(f"[MANAGE] 开始管理订单: {order_id}")
-
-            # 定期检查订单状态
-            check_interval = 10  # 10秒检查一次
-            start_time = time.time()
-
-            while time.time() - start_time < self.order_timeout:
-                await asyncio.sleep(check_interval)
-
-                # 检查订单状态
-                order_status = await self._get_order_status(order_id)
-                if not order_status:
-                    # 订单状态查询失败，可能是网络问题或API问题
-                    # 但订单可能已经成交，需要更新持仓数据
-                    logger.warning(f"[MANAGE] 订单状态查询失败: {order_id}，可能是网络问题，更新持仓数据")
-                    await self._update_positions_after_trade(signal)
-                    continue
-
-                # 更新订单缓存
-                if order_id in self.orders_cache:
-                    self.orders_cache[order_id] = order_status
-
-                # 订单完成检查
-                if order_status.status in ['filled', 'cancelled']:
-                    logger.info(f"[MANAGE] 订单已完成: {order_id}, 状态: {order_status.status}")
-                    break
-
-                # 部分成交处理
-                if order_status.status == 'partial_filled':
-                    logger.info(f"[MANAGE] 订单部分成交: {order_id}, 已成交: {order_status.filled_amount:.2f}")
-
-                # 超时检查
-                if time.time() > order_status.expires_at:
-                    logger.info(f"[MANAGE] 订单超时，执行撤单: {order_id}")
-                    await self._cancel_order(order_id)
-                    break
-
-        except Exception as e:
-            logger.error(f"[MANAGE] 订单管理失败: {e}")
-
-        # 无论订单管理如何结束，都要更新持仓数据
-        logger.info(f"[MANAGE] 订单管理结束，更新持仓数据")
-        await self._update_positions_after_trade(signal)
-
-    async def _get_order_status(self, order_id):
-        """获取订单状态"""
-        try:
-
-            client = self._get_clob_client()
-            # 获取订单详情
-            order_data = await asyncio.to_thread(client.get_order, order_id)
-
-            # 映射状态
-            status_map = {
-                'OPEN': 'pending',
-                'PARTIAL_FILLED': 'partial_filled',
-                'FILLED': 'filled',
-                'CANCELLED': 'cancelled',
-                'EXPIRED': 'expired',
-            }
-            raw_status = order_data.get('status', 'UNKNOWN')
-            status = status_map.get(raw_status, 'unknown')
-
-            # 确保 side 是大写
-            side = order_data.get('side', '').upper()
-
-            # 解析数量
-            # API返回的size和filledSize可能是字符串
-            size = float(order_data.get('size', 0))
-            filled = float(order_data.get('filledSize', 0))
-            price = float(order_data.get('price', 0))
-
-            # 时间戳处理（可能为毫秒）
-            created_at = order_data.get('createdAt')
-            if created_at is not None:
-                try:
-                    # 如果是毫秒，转换为秒
-                    if created_at > 1e10:  # 大于 2e9 认为是毫秒
-                        created_at = created_at / 1000.0
-                except:
-                    created_at = time.time()
-            else:
-                created_at = time.time()
-
-            expires_at = order_data.get('expiresAt')
-            if expires_at is not None:
-                try:
-                    if expires_at > 1e10:
-                        expires_at = expires_at / 1000.0
-                except:
-                    expires_at = time.time() + self.order_timeout
-            else:
-                expires_at = time.time() + self.order_timeout
-
-            order_status = OrderStatus(
-                order_id=order_id,
-                token_id=order_data.get('tokenId', ''),
-                side=side,
-                amount=size,
-                filled_amount=filled,
-                price=price,
-                created_at=created_at,
-                status=status,
-                expires_at=expires_at,
-                original_signal=''  # 无法从API获取，留空
-            )
-            # 更新缓存
-            self.orders_cache[order_id] = order_status
-            return order_status
-
-        except Exception as e:
-            logger.error(f"[STATUS] 获取订单状态失败: {e}")
-            return None
-
-    async def _cancel_order(self, order_id):
-        """取消订单"""
-        try:
-            logger.info(f"[CANCEL] 取消订单: {order_id}")
-
-            client = self._get_clob_client()
-
-            # 尝试刷新凭证以确保撤单成功 (参考下单逻辑)
-            try:
-                creds = await asyncio.to_thread(client.create_or_derive_api_creds)
-                client.set_api_creds(creds)
-            except Exception as e:
-                logger.warning(f"[CANCEL] 刷新凭证失败，尝试使用现有凭证撤单: {e}")
-
-            # 执行撤单并获取响应
-            resp = await asyncio.to_thread(client.cancel, order_id)
-            
-            logger.info(f"[CANCEL] 撤单响应: {resp}")
-
-            # 更新缓存
-            if order_id in self.orders_cache:
-                self.orders_cache[order_id].status = 'cancelled'
-            logger.info(f"[CANCEL] 订单已标记为取消")
-        except Exception as e:
-            logger.error(f"[CANCEL] 取消订单失败: {e}")
-
 
     # API调用方法 (待实现)
     async def _get_trader_usdc_balance(self, trader_address):

@@ -150,7 +150,7 @@ async def main():
         trade_config = config.get_trade_config_summary()
         logger.info(f"[CONFIG] 交易配置摘要:")
         logger.info(f"   - 跟单比例: {trade_config['copy_ratio']*100:.1f}%")
-        logger.info(f"   - 订单超时: {trade_config['order_timeout']}秒")
+        logger.info(f"   - 订单有效期(GTD): {trade_config['order_expiry_seconds']}秒")
         logger.info(f"   - 信号有效期: {trade_config['signal_expiry']}秒")
         logger.info(f"   - 代理钱包: {'已配置' if trade_config['proxy_wallet_configured'] else '未配置'}")
 
@@ -209,9 +209,6 @@ async def main():
 
                     # 注释：初始化时已经获取过共享持仓，运行时不再重复获取以避免429错误
                     # await memory_monitor.check_shared_positions_by_tokens()
-
-                    # 挂单撤单扫描：每分钟触发一次（内部每5分钟节流）
-                    await memory_monitor.maybe_cancel_due_open_orders()
 
                     await asyncio.sleep(60)  # 每分钟更新一次
 
@@ -346,10 +343,6 @@ async def main():
         logger.info("[SHUTDOWN] 服务关闭完成")
 
 if __name__ == "__main__":
-    # Windows 下 asyncio 的事件循环策略调整
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
     # 检查命令行模式
     if len(sys.argv) > 1:
         mode = sys.argv[1].lower()

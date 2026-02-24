@@ -22,17 +22,6 @@ class BalanceRecord:
     timestamp: str
 
 @dataclass
-class OpenOrderRecord:
-    """挂单记录（用于超时撤单）"""
-    order_id: str
-    token_id: str
-    side: str  # BUY/SELL
-    created_at: float
-    next_cancel_check_at: float
-    last_status: str = ""
-    last_checked_at: float = 0.0
-
-@dataclass
 class TraderPosition:
     """交易员持仓记录"""
     trader_address: str
@@ -83,16 +72,6 @@ class IntegratedMonitor:
         self.position_cache = {}
         self.trader_positions_cache = {}
         self.shared_positions_cache = {}
-
-        # 挂单缓存：order_id -> OpenOrderRecord
-        self.open_orders_cache: Dict[str, OpenOrderRecord] = {}
-
-        # 扫描频率（每5分钟触发一次扫描）
-        self._last_open_orders_sweep_ts: float = 0.0
-        self._open_orders_poll_interval_sec: int = 60 # 优化：从300s改为60s，加快撤单响应
-
-        # 重试间隔（状态未知/查询失败时，延后多久再查）
-        self._open_orders_sweep_interval_sec: int = 300
 
         self.api_url = "https://data-api.polymarket.com/positions"
         self.config = get_config()
@@ -995,158 +974,12 @@ class IntegratedMonitor:
         """获取共享持仓缓存数据"""
         return self.shared_positions_cache
 
-    def get_open_orders_cache(self) -> Dict[str, OpenOrderRecord]:
-        """获取挂单缓存数据"""
-        return self.open_orders_cache
-
-    def cache_open_order(
-        self,
-        order_id: str,
-        token_id: str,
-        side: str,
-        created_at: Optional[float] = None,
-        delay_seconds: int = 300,
-    ):
-        """
-        缓存挂单，用于后续撤单检查。
-        - 仅缓存“需要在5分钟后再次确认是否仍未完成”的订单
-        """
-        now = time.time()
-        record = OpenOrderRecord(
-            order_id=order_id,
-            token_id=token_id,
-            side=side,
-            created_at=created_at if created_at is not None else now,
-            next_cancel_check_at=now + delay_seconds,
-        )
-        self.open_orders_cache[order_id] = record
-
-    def remove_open_order(self, order_id: str):
-        """从缓存移除挂单"""
-        if order_id in self.open_orders_cache:
-            del self.open_orders_cache[order_id]
-
-    def _get_clob_client(self):
-        """
-        获取 ClobClient 实例（使用统一创建函数）。
-        """
-        try:
-            from config import create_clob_client
-            return create_clob_client(
-                config=self.config,
-            )
-        except ImportError as e:
-            logger.error(f"[ORDER-CHECK] 导入失败: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"[ORDER-CHECK] 创建 ClobClient 失败: {e}")
-            return None
-
-    async def maybe_cancel_due_open_orders(self):
-        """
-        每次被调用时进行节流（按“扫描频率”）：
-        - 每分钟最多扫描一次
-        - 实际只会处理 next_cancel_check_at 已到期的订单（否则直接返回），避免频繁打 CLOB
-        """
-        now = time.time()
-        if now - self._last_open_orders_sweep_ts < self._open_orders_poll_interval_sec:
-            return
-        self._last_open_orders_sweep_ts = now
-        await self.cancel_due_open_orders()
-
-    async def cancel_due_open_orders(self):
-        """
-        检查并清理过期挂单：
-        1. 从 API 获取当前所有 Open Orders（解决重启后缓存丢失问题）
-        2. 同步到本地缓存
-        3. 检查是否超时（默认5分钟），超时则撤单
-        """
-        client = self._get_clob_client()
-        if client is None:
-            return
-
-        # 1. 刷新凭证 (确保有权限操作)
-        try:
-            creds = await asyncio.to_thread(client.create_or_derive_api_creds)
-            client.set_api_creds(creds)
-        except Exception as e:
-            logger.warning(f"[ORDER-CHECK] 刷新凭证失败: {e}")
-
-        try:
-            # 2. 获取当前所有挂单 (Open Orders)
-            open_orders = await asyncio.to_thread(client.get_orders)
-            if not open_orders:
-                # 如果没有挂单，清空缓存
-                self.open_orders_cache.clear()
-                return
-
-            now = time.time()
-            
-            # 3. 遍历检查每个挂单
-            for order in open_orders:
-                # 尝试多种可能的键名获取订单ID
-                order_id = order.get('orderID') or order.get('id') or order.get('order_id')
-                
-                if not order_id:
-                    logger.warning(f"[ORDER-CHECK] 无法解析订单ID，跳过: {order.keys()}")
-                    continue
-
-                # 获取创建时间
-                created_at_ts = now # 默认当前时间
-                created_at_raw = order.get('createdAt')
-                
-                if created_at_raw:
-                    try:
-                        # 处理可能的时间戳格式 (秒或毫秒)
-                        ts = float(created_at_raw)
-                        if ts > 1e10: # 毫秒
-                            created_at_ts = ts / 1000.0
-                        else:
-                            created_at_ts = ts
-                    except:
-                        pass
-
-                # 如果缓存中没有，添加到缓存
-                if order_id not in self.open_orders_cache:
-                    # 计算剩余等待时间 (5分钟超时)
-                    timeout_seconds = 300
-                    elapsed = now - created_at_ts
-                    remaining = timeout_seconds - elapsed
-                    # 如果已经超时，delay设为0（立即检查）；否则设为剩余时间
-                    delay = max(0, remaining)
-                    
-                    self.cache_open_order(
-                        order_id=order_id,
-                        token_id=order.get('asset_id', ''),
-                        side=order.get('side', ''),
-                        created_at=created_at_ts,
-                        delay_seconds=int(delay)
-                    )
-                    logger.info(f"[ORDER-CHECK] 同步挂单: {order_id}, 创建于: {datetime.fromtimestamp(created_at_ts)}, 已过去: {elapsed:.0f}s, 剩余: {delay:.0f}s")
-
-                # 检查是否超时
-                rec = self.open_orders_cache.get(order_id)
-                if rec and now >= rec.next_cancel_check_at:
-                    logger.info(f"[ORDER-CHECK] 订单超时 ({now - rec.created_at:.0f}s > 300s)，执行撤单: {order_id}")
-                    try:
-                        await asyncio.to_thread(client.cancel, order_id)
-                        logger.info(f"[ORDER-CHECK] 撤单成功: {order_id}")
-                        self.remove_open_order(order_id)
-                    except Exception as e:
-                        logger.error(f"[ORDER-CHECK] 撤单失败: {order_id}, {e}")
-                        # 失败后延后重试
-                        rec.next_cancel_check_at = now + 60
-
-        except Exception as e:
-            logger.error(f"[ORDER-CHECK] 扫描挂单失败: {e}")
-
     def clear_all_caches(self):
         """清空所有内存缓存数据"""
         self.balance_cache = {}
         self.position_cache = {}
         self.trader_positions_cache = {}
         self.shared_positions_cache = {}
-        self.open_orders_cache = {}
         print("所有内存缓存已清空")
 
     def get_cache_summary(self) -> Dict:
@@ -1156,7 +989,6 @@ class IntegratedMonitor:
             "position_cache_exists": bool(self.position_cache),
             "trader_positions_cache_size": len(self.trader_positions_cache),
             "shared_positions_cache_exists": bool(self.shared_positions_cache),
-            "open_orders_cache_size": len(self.open_orders_cache),
             "position_count": len(self.position_cache.get('positions', [])) if self.position_cache else 0,
             "shared_positions_count": len(self.shared_positions_cache.get('shared_positions', {})) if self.shared_positions_cache else 0
         }
