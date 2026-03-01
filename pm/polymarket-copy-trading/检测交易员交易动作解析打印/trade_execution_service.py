@@ -21,10 +21,8 @@ import math
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict
-from config import Config, logger
+from config import Config, logger, TRADER_NICKNAME_CACHE
 from enrichment_service import EnrichmentService
-
-TRADER_NICKNAME_CACHE: dict = {}
 
 def get_trader_display_info(trader_address: str) -> str:
     """获取交易员显示信息（昵称或地址）"""
@@ -492,6 +490,7 @@ class TradeExecutionService:
         - 当交易员对该 token "有持仓"时，才触发本过滤；
         - 若交易员本次下单金额未达到其余额的一定比例阈值，则跳过该订单。
         - 例外：如果交易员本次下单金额超过大额阈值（LARGE_ORDER_THRESHOLD），则跳过此限制
+        - 优先级：如果交易员配置了单独的最小下单金额（TRADER_MIN_ORDER_SIZES），则跳过 MIN_TRADE_RATIO 检查
 
         阈值定义：
         - 阈值百分比读取自 [`Config.MIN_TRADE_RATIO`](检测交易员交易动作解析打印/config.py:100)
@@ -504,14 +503,26 @@ class TradeExecutionService:
         - False：继续执行后续定价/算参/下单
         """
         try:
-            # 检查交易员最小下单金额
-            min_trader_order_size = self.config.min_trader_order_size
+            # 检查交易员最小下单金额（优先使用单独配置）
+            min_trader_order_size = self.config.get_trader_min_order_size(signal.source_address)
+            
+            # 如果交易员配置了单独的最小下单金额，跳过 MIN_TRADE_RATIO 检查
+            trader_address = signal.source_address.lower()
+            has_custom_min_order = trader_address in self.config.trader_min_order_sizes
+            
             if signal.amount_usdc < min_trader_order_size:
                 logger.info(
                     f"[TRADE] 交易员下单金额 {signal.amount_usdc:.2f} USDC "
                     f"< 最小下单金额 {min_trader_order_size:.2f} USDC，跳过该订单"
                 )
                 return True
+            
+            # 如果交易员有单独的最小下单金额配置，跳过 MIN_TRADE_RATIO 检查
+            if has_custom_min_order:
+                logger.info(
+                    f"[TRADE] 交易员配置了单独的最小下单金额，跳过 MIN_TRADE_RATIO 检查"
+                )
+                return False
 
             # 检查是否为大额交易，如果是则跳过 min_trade_ratio 限制
             large_order_threshold = self.config.large_order_threshold
@@ -757,7 +768,10 @@ class TradeExecutionService:
         计算溢价后的下单价格
         
         策略：
-        - BUY: trader_price + buy_premium, max 0.99. (若 trader_price > 0.99 则返回 None 跳过)
+        - BUY: 
+          - 如果 trader_price < low_price_threshold，使用 low_price_buy_premium
+          - 否则使用 buy_premium
+          - max 0.99. (若 trader_price > 0.99 则返回 None 跳过)
         - SELL: trader_price - sell_premium, min 0.01.
         """
         try:
@@ -767,7 +781,7 @@ class TradeExecutionService:
             price_f = float(trader_price)
             
             if side == "BUY":
-                if price_f >= self.config.max_price_threshold:
+                if self.config.max_price_threshold > 0 and price_f >= self.config.max_price_threshold:
                     logger.info(f"[PRICE] BUY 跳过: trader_price={price_f:.6f} >= max_price_threshold={self.config.max_price_threshold}")
                     return None
                 
@@ -775,15 +789,18 @@ class TradeExecutionService:
                     logger.info(f"[PRICE] BUY 跳过: trader_price={price_f:.6f} > 0.99")
                     return None
                 
-                premium = self.config.buy_premium
+                if price_f < self.config.low_price_threshold:
+                    premium = self.config.low_price_buy_premium
+                    logger.info(f"[PRICE] 低价股溢价: trader_price={price_f:.6f} < threshold={self.config.low_price_threshold}, 使用溢价={premium}")
+                else:
+                    premium = self.config.buy_premium
+                
                 raw_price = price_f + premium
-                # clamp(raw, 0.001, 0.99)
                 controlled_price = min(max(raw_price, cap_min), cap_max)
                 
-            else: # SELL
+            else:
                 premium = self.config.sell_premium
                 raw_price = price_f - premium
-                # max(raw, 0.01) -> min(..., 0.99)
                 controlled_price = max(raw_price, 0.01)
                 controlled_price = min(controlled_price, cap_max)
 
@@ -1953,27 +1970,48 @@ class TradeExecutionService:
         try:
             rpc_url = getattr(self.config, 'rpc_url', 'https://polygon-rpc.com')
 
+            # 确保地址有 0x 前缀
+            if not wallet_address.startswith('0x'):
+                wallet_address = '0x' + wallet_address
+
+            # USDC balanceOf(address) 函数签名: 0x70a08231
+            # 需要补齐到 64 字节（32 字节 = 64 十六进制字符）
+            address_padded = wallet_address[2:].lower().rjust(64, '0')
+            call_data = f"0x70a08231{address_padded}"
+
             data = {
                 "jsonrpc": "2.0",
                 "method": "eth_call",
                 "params": [{
                     "to": token_contract,
-                    "data": f"0x70a08231000000000000000000000000{wallet_address[2:]}"
+                    "data": call_data
                 }, "latest"],
                 "id": 1
             }
 
+            logger.debug(f"[BALANCE] RPC请求: {rpc_url}")
+            logger.debug(f"[BALANCE] 请求参数: {data}")
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(rpc_url, json=data, timeout=10) as response:
+                    logger.debug(f"[BALANCE] 响应状态: {response.status}")
                     if response.status == 200:
                         result = await response.json()
+                        logger.debug(f"[BALANCE] 响应结果: {result}")
                         if "result" in result and result["result"] and result["result"] != "0x":
                             # USDC有6位小数
                             balance_wei = int(result["result"], 16)
                             return balance_wei / 1000000
+                        else:
+                            logger.warning(f"[BALANCE] RPC返回无效结果: {result}")
+                    else:
+                        response_text = await response.text()
+                        logger.warning(f"[BALANCE] RPC请求失败: HTTP {response.status}, {response_text}")
             return 0.0
         except Exception as e:
+            import traceback
             logger.warning(f"[BALANCE] RPC获取余额失败: {e}")
+            logger.debug(f"[BALANCE] 堆栈: {traceback.format_exc()}")
             return 0.0
 
     async def _fetch_trader_positions(self, trader_address: str):

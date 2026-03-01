@@ -21,6 +21,8 @@ def setup_logger(name="PolymarketMonitor"):
 
 logger = setup_logger()
 
+TRADER_NICKNAME_CACHE: Dict[str, str] = {}
+
 class SecureConfig:
     """
     安全配置类 - 从.env文件加载配置，敏感数据保留在内存中方便使用
@@ -72,10 +74,13 @@ class SecureConfig:
         self.retry_delay: float = 1.0
         self.market_title_blacklist: List[str] = []
         self.buy_premium: float = 0.01
+        self.low_price_buy_premium: float = 0.1
+        self.low_price_threshold: float = 0.3
         self.sell_premium: float = 0.02
         self.max_price_threshold: float = 0.98
         self.large_order_threshold: float = 1000
         self.min_trader_order_size: float = 500
+        self.trader_min_order_sizes: Dict[str, float] = {}
         self.max_position_per_market_ratio: float = 0.1
         self.max_position_per_market_amount: Optional[float] = None
         self.max_position_per_market_shares: Optional[float] = None
@@ -233,6 +238,18 @@ class SecureConfig:
         except ValueError:
             self.buy_premium = 0.01
         
+        # 低价股买入溢价
+        try:
+            self.low_price_buy_premium = float(os.getenv("LOW_PRICE_BUY_PREMIUM", "0.1"))
+        except ValueError:
+            self.low_price_buy_premium = 0.1
+        
+        # 低价股阈值
+        try:
+            self.low_price_threshold = float(os.getenv("LOW_PRICE_THRESHOLD", "0.3"))
+        except ValueError:
+            self.low_price_threshold = 0.3
+        
         # 卖出折价
         try:
             self.sell_premium = float(os.getenv("SELL_PREMIUM", "0.02"))
@@ -256,6 +273,14 @@ class SecureConfig:
             self.min_trader_order_size = float(os.getenv("MIN_TRADER_ORDER_SIZE", "500"))
         except ValueError:
             self.min_trader_order_size = 500
+        
+        # 交易员单独最小下单金额
+        try:
+            self.trader_min_order_sizes = json.loads(os.getenv("TRADER_MIN_ORDER_SIZES", "{}"))
+            self.trader_min_order_sizes = {k.lower(): v for k, v in self.trader_min_order_sizes.items()}
+        except json.JSONDecodeError:
+            logger.warning("TRADER_MIN_ORDER_SIZES in .env is not a valid JSON. Using empty config.")
+            self.trader_min_order_sizes = {}
         
         # 每个市场持仓限制
         try:
@@ -338,6 +363,17 @@ class SecureConfig:
                     logger.warning(f"Invalid copy_ratio for trader {trader_address}, using global default")
         
         return self.copy_ratio
+    
+    def get_trader_min_order_size(self, trader_address: str) -> float:
+        """获取指定交易员的最小下单金额"""
+        if not trader_address:
+            return self.min_trader_order_size
+        
+        trader_address = trader_address.lower()
+        if trader_address in self.trader_min_order_sizes:
+            return float(self.trader_min_order_sizes[trader_address])
+        
+        return self.min_trader_order_size
     
     def get_trade_config_summary(self):
         """获取交易配置摘要"""

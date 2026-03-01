@@ -29,14 +29,15 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, Any, Optional
 
-from config import Config, logger, get_config
+from config import Config, logger, get_config, TRADER_NICKNAME_CACHE
 from enrichment_service import EnrichmentService
 from monitor_service import MonitorService
 from trade_execution_service import TradeExecutionService
 from position_analysis_service import PositionAnalysisService
 from auto_redeem import AutoRedeemService
+from asset_tracker import AssetTracker
 
-TRADER_NICKNAME_CACHE: Dict[str, str] = {}
+asset_tracker = None
 
 async def fetch_single_nickname(session, trader):
     """获取单个交易员昵称并缓存"""
@@ -133,6 +134,8 @@ async def position_analysis_mode():
 
 async def main():
     """API轮询监控和交易功能的主程序"""
+    global asset_tracker
+    
     logger.info("\n" + "="*80)
     logger.info("[START] Polymarket跟单机器人 - API轮询版 v1.0")
     logger.info("="*80)
@@ -278,11 +281,20 @@ async def main():
     # 启动自动赎回后台任务（每小时执行一次，完全静默）
     logger.info("[INIT] 启动自动赎回后台任务（每小时静默执行）...")
     asyncio.create_task(redeem_task())
-
+    
     # 4. 初始化交易执行服务（使用内存变量）
     logger.info("[INIT] 初始化交易执行服务...")
     trade_executor = TradeExecutionService(config, enricher, memory_monitor)
     await trade_executor.start()
+    
+    # 初始化ClobClient用于资产跟踪
+    logger.info("[INIT] 初始化ClobClient...")
+    clob_client = config.create_clob_client()
+    
+    # 启动资产跟踪（每小时检测一次，亏损20%自动停止）
+    logger.info("[INIT] 启动资产跟踪（每小时检测，亏损20%自动停止）...")
+    asset_tracker = AssetTracker(memory_monitor, config, clob_client)
+    asyncio.create_task(asset_tracker.start_tracking())
 
     # 5. 初始化API监控服务
     logger.info("[INIT] 初始化API监控服务...")
@@ -291,7 +303,12 @@ async def main():
 
     # 优雅退出处理
     def handle_exit(sig, frame):
+        global asset_tracker
         logger.info("\n[SHUTDOWN] 接收到退出信号，正在优雅关闭...")
+
+        # 停止资产跟踪
+        if asset_tracker:
+            asset_tracker.stop()
 
         # 停止监控
         logger.info("[SHUTDOWN] 停止API监控服务...")
